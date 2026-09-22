@@ -1,0 +1,5 @@
+(library
+ (name signal)
+ (public_name ocaml-signal)
+ (wrapped false)
+ (modes native byte melange))
