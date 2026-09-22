@@ -6,11 +6,15 @@
 
 (generate_opam_files true)
 
+(source
+ (github logseq/ocaml-signal))
+
 (package
  (name ocaml-signal)
  (maintainers "Tienson Qin <tiensonqin@gmail.com>")
  (authors "Tienson Qin")
  (license MIT)
+ (documentation https://github.com/logseq/ocaml-signal)
  (synopsis "A small statically typed incremental runtime for OCaml")
  (description
   "Reactive values, scoped state, lifecycle, effects, switches, and keyed collections. OCaml port of signal-lg.")

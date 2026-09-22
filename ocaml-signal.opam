@@ -7,6 +7,9 @@ description:
 maintainer: ["Tienson Qin <tiensonqin@gmail.com>"]
 authors: ["Tienson Qin"]
 license: "MIT"
+homepage: "https://github.com/logseq/ocaml-signal"
+doc: "https://github.com/logseq/ocaml-signal"
+bug-reports: "https://github.com/logseq/ocaml-signal/issues"
 depends: [
   "ocaml" {>= "5.1"}
   "dune" {>= "3.17" & >= "3.17"}
@@ -27,3 +30,4 @@ build: [
     "@doc" {with-doc}
   ]
 ]
+dev-repo: "git+https://github.com/logseq/ocaml-signal.git"

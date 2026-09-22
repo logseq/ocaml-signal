@@ -1,4 +1,4 @@
 (test
  (name test_signal)
  (modules test_signal)
- (libraries signal alcotest))
+ (libraries ocaml-signal alcotest))
