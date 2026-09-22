@@ -3,10 +3,8 @@
 A small statically typed incremental runtime for OCaml: reactive values,
 scoped state, lifecycle, effects, switches, and keyed collections.
 
-`ocaml-signal` is the plain-OCaml port of
-[signal-lg](https://github.com/logseq/signal-lg). It keeps the same API and
-semantics while exposing a conventional OCaml library instead of an LG
-package.
+A conventional OCaml library: create a scheduler, feed it states, derive
+signals, and let `stabilize` flush staged changes to subscribers.
 
 ## Concepts
 
@@ -25,7 +23,7 @@ package.
 - **Keyed collections** — `keyed` reconciles a collection of items by key,
   mounts a scope per item, and reports `Insert`/`Remove`/`Move` patches.
 
-See `src/signal.mli` for the full API.
+See `src/signal.mli` for the documented API.
 
 ## Building
 

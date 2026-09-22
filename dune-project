@@ -17,7 +17,7 @@
  (documentation https://github.com/logseq/ocaml-signal)
  (synopsis "A small statically typed incremental runtime for OCaml")
  (description
-  "Reactive values, scoped state, lifecycle, effects, switches, and keyed collections. OCaml port of signal-lg.")
+  "Reactive values, scoped state, lifecycle, effects, switches, and keyed collections.")
  (depends
   (ocaml (>= 5.1))
   (dune (>= 3.17))
