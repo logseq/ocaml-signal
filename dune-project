@@ -21,4 +21,5 @@
  (depends
   (ocaml (>= 5.1))
   (dune (>= 3.17))
+  (melange (>= 6.0))
   (alcotest :with-test)))

@@ -13,6 +13,7 @@ bug-reports: "https://github.com/logseq/ocaml-signal/issues"
 depends: [
   "ocaml" {>= "5.1"}
   "dune" {>= "3.17" & >= "3.17"}
+  "melange" {>= "6.0"}
   "alcotest" {with-test}
   "odoc" {with-doc}
 ]
