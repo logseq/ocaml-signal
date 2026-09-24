@@ -26,10 +26,10 @@ let test_constant_and_state_batching () =
   set state 1;
   set state 2;
   update state (fun v -> v + 3);
-  check_int "state remains stable before stabilization" 0 (get state);
+  check_int "state remains stable before stabilization" 0 (get_state state);
   check_int "initial generation" 0 (generation scheduler);
   stabilize scheduler;
-  check_int "batched state result" 5 (get state);
+  check_int "batched state result" 5 (get_state state);
   check "batched state emits once" [ "0"; "5" ] !observed;
   check_int "generation after work" 1 (generation scheduler);
   stabilize scheduler;
@@ -181,7 +181,7 @@ let test_effect_queue () =
       update state (fun v -> v + 1));
   stabilize scheduler;
   check "effects execute in FIFO order" [ "first"; "second"; "third" ] !trace;
-  check_int "effects share one stabilization batch" 12 (get state);
+  check_int "effects share one stabilization batch" 12 (get_state state);
   check_int "effect batch generation" 1 (generation scheduler)
 
 let test_scope_lifecycle_and_state_slots () =
@@ -201,7 +201,7 @@ let test_scope_lifecycle_and_state_slots () =
   stabilize scheduler;
   let second_state = state_at scheduler parent slot 999 in
   check_bool "state slot preserves identity" true (first_state == second_state);
-  check_int "reused state slot ignores new initializer" 9 (get second_state);
+  check_int "reused state slot ignores new initializer" 9 (get_state second_state);
   dispose_scope parent;
   dispose_scope parent;
   check_int "scope disposal releases state slots" 0

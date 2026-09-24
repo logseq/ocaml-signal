@@ -151,6 +151,8 @@ let constant owner initial =
 
 let sample reactive = !(reactive.current)
 
+let get = sample
+
 let subscribe ?(emit_initial = true) reactive callback =
   if !(reactive.disposed_signal)
   then invalid_arg "cannot observe a disposed signal";
@@ -205,7 +207,7 @@ let state owner initial =
 
 let value state_value = state_value.state_signal
 
-let get state_value = sample (value state_value)
+let get_state state_value = sample (value state_value)
 
 let set state_value next_value =
   state_value.pending := Some next_value;
@@ -220,7 +222,7 @@ let update state_value update_fn =
   let current =
     match !(state_value.pending) with
     | Some pending_value -> pending_value
-    | None -> get state_value
+    | None -> get_state state_value
   in
   set state_value (update_fn current)
 
@@ -509,14 +511,14 @@ let reconcile_keyed scheduler entries_ref items key_fn compare
         let key = key_fn current in
         match nth_opt entries index with
         | Some entry when compare entry.entry_key key = 0 ->
-          if get entry.entry_state <> current
+          if get_state entry.entry_state <> current
           then set entry.entry_state current;
           loop (index + 1) entries
         | _ -> (
           match find_entry_index entries key compare with
           | Some existing_index ->
             let entry = List.nth entries existing_index in
-            if get entry.entry_state <> current
+            if get_state entry.entry_state <> current
             then set entry.entry_state current;
             on_patch (Move (key, existing_index, index));
             loop (index + 1) (move_entry entries existing_index index)
