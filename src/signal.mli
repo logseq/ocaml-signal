@@ -156,8 +156,13 @@ val value : 'value state -> 'value signal
 (** [sample sig] reads the current value without subscribing. *)
 val sample : 'value signal -> 'value
 
-(** [get st] is {!sample} of [value st]. *)
-val get : 'value state -> 'value
+(** [get sig] is {!sample}: reads the current value of a signal without
+    subscribing. [get] is the uniform read verb — it works on any [signal];
+    use {!get_state} when holding a [state]. *)
+val get : 'value signal -> 'value
+
+(** [get_state st] is {!get} of [value st]. *)
+val get_state : 'value state -> 'value
 
 (** [set st v] stages [v] as the next value; published on {!stabilize}. *)
 val set : 'value state -> 'value -> unit
