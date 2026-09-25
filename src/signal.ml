@@ -107,6 +107,10 @@ let schedule_once owner scheduled task =
         task ())
   end
 
+let max_stabilization_rounds = 10000
+
+exception Stabilization_limit_exceeded of int * int * int
+
 let stabilize owner =
   let worked = ref false in
   let rounds = ref 0 in
@@ -121,6 +125,10 @@ let stabilize owner =
     else begin
       worked := true;
       incr rounds;
+      if !rounds > max_stabilization_rounds then
+        raise
+          (Stabilization_limit_exceeded
+             (max_stabilization_rounds, !effect_count, !dirty_count));
       effect_count := !effect_count + List.length effects;
       owner.effects := [];
       List.iter (fun f -> f ()) effects;

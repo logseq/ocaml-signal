@@ -136,10 +136,21 @@ val enqueue_dirty : scheduler -> (unit -> unit) -> unit
     [false] before running [task], so a task may reschedule itself. *)
 val schedule_once : scheduler -> bool ref -> (unit -> unit) -> unit
 
+(** Raised by {!stabilize} when the queues do not reach a fixpoint within
+    {!max_stabilization_rounds} rounds — i.e. an effect or dirty task keeps
+    re-dirtying the scheduler unconditionally. Carries (round cap, effects
+    run, dirty tasks run) to identify the runaway loop. *)
+exception Stabilization_limit_exceeded of int * int * int
+
+(** Maximum rounds {!stabilize} will run before raising
+    {!Stabilization_limit_exceeded}. *)
+val max_stabilization_rounds : int
+
 (** [stabilize owner] drains the effect and dirty queues to a fixpoint: each
     round runs all queued effects, then all dirty tasks, repeating until both
     queues are empty. Increments {!generation} and updates
-    {!last_stabilization} only when at least one task ran. *)
+    {!last_stabilization} only when at least one task ran.
+    @raise Stabilization_limit_exceeded on a runaway loop. *)
 val stabilize : scheduler -> unit
 
 (** {1 Signal and state operations} *)
