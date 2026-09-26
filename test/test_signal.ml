@@ -97,6 +97,18 @@ let test_stabilization_diagnostics_count_scheduled_work () =
   check_int "a no-op reports zero dirty work" 0
     diagnostics.stabilization_dirty_tasks
 
+let test_stabilize_raises_on_runaway () =
+  let scheduler = scheduler () in
+  let rec task () = enqueue_dirty scheduler task in
+  enqueue_dirty scheduler task;
+  match stabilize scheduler with
+  | () -> Alcotest.fail "stabilize did not raise on a runaway loop"
+  | exception Stabilization_limit_exceeded (cap, effects, dirty) ->
+    check_int "runaway stops at the round cap" max_stabilization_rounds cap;
+    check_int "cap run reports no effects" 0 effects;
+    check_int "dirty tasks counted before the raise" max_stabilization_rounds
+      dirty
+
 let test_map_rejects_mixed_schedulers () =
   let left = constant (scheduler ()) 1 in
   let right = constant (scheduler ()) 2 in
@@ -453,6 +465,8 @@ let () =
           Alcotest.test_case "incremental map" `Quick test_incremental_map;
           Alcotest.test_case "stabilization diagnostics count scheduled work"
             `Quick test_stabilization_diagnostics_count_scheduled_work;
+          Alcotest.test_case "stabilize raises on runaway" `Quick
+            test_stabilize_raises_on_runaway;
           Alcotest.test_case "map rejects mixed schedulers" `Quick
             test_map_rejects_mixed_schedulers;
           Alcotest.test_case "cutoff and subscription cleanup" `Quick
