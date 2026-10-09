@@ -5,17 +5,32 @@ type stabilization_diagnostics = {
   stabilization_dirty_tasks : int;
 }
 
+module Rank_map = Map.Make (Int)
+
+type computation_queue = (unit -> unit) Queue.t Rank_map.t
+
 type scheduler = {
-  effects : (unit -> unit) list ref;
-  dirty : (unit -> unit) list ref;
-  computations : (int * (unit -> unit)) list ref;
+  effects : (unit -> unit) Queue.t;
+  dirty : (unit -> unit) Queue.t;
+  computations : computation_queue ref;
   generation_value : int ref;
   last_stabilization_value : stabilization_diagnostics ref;
 }
 
 type subscription = { disposed : bool ref; cancel : unit -> unit }
 
-type 'value subscriber = { subscriber_id : int; callback : 'value -> unit }
+type 'value subscriber = {
+  subscriber_id : int;
+  mutable callback : 'value -> unit;
+  subscriber_disposed : bool ref;
+  mutable previous : 'value subscriber option;
+  mutable next : 'value subscriber option;
+}
+
+type 'value subscribers = {
+  mutable first : 'value subscriber option;
+  mutable last : 'value subscriber option;
+}
 
 type cleanup_entry = { cleanup_id : int; cleanup_callback : unit -> unit }
 
@@ -24,7 +39,7 @@ type 'value signal = {
   rank : int;
   current : 'value ref;
   next_subscriber_id : int ref;
-  subscribers : 'value subscriber list ref;
+  subscribers : 'value subscribers;
   upstream_subscriptions : subscription list ref;
   disposed_signal : bool ref;
 }
@@ -78,9 +93,9 @@ type ('key, 'item) keyed = {
 
 let scheduler () =
   {
-    effects = ref [];
-    dirty = ref [];
-    computations = ref [];
+    effects = Queue.create ();
+    dirty = Queue.create ();
+    computations = ref Rank_map.empty;
     generation_value = ref 0;
     last_stabilization_value =
       ref
@@ -96,9 +111,8 @@ let generation owner = !(owner.generation_value)
 
 let last_stabilization owner = !(owner.last_stabilization_value)
 
-let enqueue_effect owner f = owner.effects := !(owner.effects) @ [ f ]
-
-let enqueue_dirty owner task = owner.dirty := !(owner.dirty) @ [ task ]
+let enqueue_effect owner f = Queue.add f owner.effects
+let enqueue_dirty owner task = Queue.add task owner.dirty
 
 let schedule_once owner scheduled task =
   if !scheduled
@@ -113,24 +127,32 @@ let schedule_once owner scheduled task =
 let schedule_computation reactive scheduled task =
   if not !scheduled then begin
     scheduled := true;
-    reactive.owner.computations :=
-      !(reactive.owner.computations)
-      @ [
-          ( reactive.rank,
-            fun () ->
-              scheduled := false;
-              if not !(reactive.disposed_signal) then task () );
-        ]
+    let queue =
+      match Rank_map.find_opt reactive.rank !(reactive.owner.computations) with
+      | Some queue -> queue
+      | None ->
+          let queue = Queue.create () in
+          reactive.owner.computations :=
+            Rank_map.add reactive.rank queue !(reactive.owner.computations);
+          queue
+    in
+    Queue.add
+      (fun () ->
+        scheduled := false;
+        if not !(reactive.disposed_signal) then task ())
+      queue
   end
 
-let rec run_tasks queue run = function
-  | [] -> ()
-  | task :: remaining ->
-      (try run task
-       with exn ->
-         queue := remaining @ !queue;
-         raise exn);
-      run_tasks queue run remaining
+let run_tasks queue count run =
+  (* Taking only the snapshot length leaves new work for the next round and
+     keeps unexecuted tasks queued if a callback raises. *)
+  for _ = 1 to count do
+    run (Queue.take queue)
+  done
+
+let prune_computation_queue owner rank queue =
+  if Queue.is_empty queue then
+    owner.computations := Rank_map.remove rank !(owner.computations)
 
 let max_stabilization_rounds = 10000
 
@@ -143,9 +165,9 @@ let stabilize owner =
   let dirty_count = ref 0 in
   let continue = ref true in
   while !continue do
-    let effects = !(owner.effects) in
-    let dirty = !(owner.dirty) in
-    if effects = [] && dirty = [] && !(owner.computations) = [] then
+    let effects = Queue.length owner.effects in
+    let dirty = Queue.length owner.dirty in
+    if effects = 0 && dirty = 0 && Rank_map.is_empty !(owner.computations) then
       continue := false
     else begin
       worked := true;
@@ -154,37 +176,27 @@ let stabilize owner =
         raise
           (Stabilization_limit_exceeded
              (max_stabilization_rounds, !effect_count, !dirty_count));
-      owner.effects := [];
-      run_tasks owner.effects
-        (fun f ->
+      run_tasks owner.effects effects (fun f ->
           incr effect_count;
-          f ())
-        effects;
-      let pending_dirty = !(owner.dirty) in
-      owner.dirty := [];
-      run_tasks owner.dirty
-        (fun task ->
+          f ());
+      let pending_dirty = Queue.length owner.dirty in
+      run_tasks owner.dirty pending_dirty (fun task ->
           incr dirty_count;
-          task ())
-        pending_dirty;
-      if effects = [] && pending_dirty = [] && !(owner.computations) <> [] then begin
+          task ());
+      if
+        effects = 0 && pending_dirty = 0
+        && not (Rank_map.is_empty !(owner.computations))
+      then begin
         (* Settle mutations first, then recompute one dependency rank per round. *)
-        let rank =
-          List.fold_left
-            (fun lowest (rank, _) -> min lowest rank)
-            max_int !(owner.computations)
-        in
-        let ready, waiting =
-          List.partition
-            (fun (task_rank, _) -> task_rank = rank)
-            !(owner.computations)
-        in
-        owner.computations := waiting;
-        run_tasks owner.computations
-          (fun (_, task) ->
-            incr dirty_count;
-            task ())
-          ready
+        let rank, queue = Rank_map.min_binding !(owner.computations) in
+        (try
+          run_tasks queue (Queue.length queue) (fun task ->
+              incr dirty_count;
+              task ())
+        with exn ->
+          prune_computation_queue owner rank queue;
+          raise exn);
+        prune_computation_queue owner rank queue
       end
     end
   done;
@@ -203,7 +215,7 @@ let constant owner initial =
     rank = 0;
     current = ref initial;
     next_subscriber_id = ref 0;
-    subscribers = ref [];
+    subscribers = { first = None; last = None };
     upstream_subscriptions = ref [];
     disposed_signal = ref false;
   }
@@ -219,20 +231,35 @@ let subscribe ?(emit_initial = true) reactive callback =
   let subscriber_id = !(reactive.next_subscriber_id) in
   let disposed = ref false in
   let subscriber_value =
-    { subscriber_id; callback = (fun v -> if not !disposed then callback v) }
+    {
+      subscriber_id;
+      callback;
+      subscriber_disposed = disposed;
+      previous = reactive.subscribers.last;
+      next = None;
+    }
   in
   let cancel () =
     if !disposed then ()
     else begin
       disposed := true;
-      reactive.subscribers :=
-        List.filter
-          (fun current -> current.subscriber_id <> subscriber_id)
-          !(reactive.subscribers)
+      (match subscriber_value.previous with
+      | None -> reactive.subscribers.first <- subscriber_value.next
+      | Some previous -> previous.next <- subscriber_value.next);
+      (match subscriber_value.next with
+      | None -> reactive.subscribers.last <- subscriber_value.previous
+      | Some next -> next.previous <- subscriber_value.previous);
+      subscriber_value.previous <- None;
+      subscriber_value.next <- None;
+      subscriber_value.callback <- ignore
     end
   in
-  reactive.subscribers := !(reactive.subscribers) @ [ subscriber_value ];
-  if emit_initial then callback (sample reactive);
+  (match reactive.subscribers.last with
+  | None -> reactive.subscribers.first <- Some subscriber_value
+  | Some previous -> previous.next <- Some subscriber_value);
+  reactive.subscribers.last <- Some subscriber_value;
+  if emit_initial then
+    (try callback (sample reactive) with exn -> cancel (); raise exn);
   { disposed; cancel }
 
 let observe reactive callback = subscribe ~emit_initial:true reactive callback
@@ -240,23 +267,38 @@ let observe reactive callback = subscribe ~emit_initial:true reactive callback
 let dispose_subscription subscription = subscription.cancel ()
 
 let dispose_signal reactive =
-  if !(reactive.disposed_signal)
-  then ()
+  if !(reactive.disposed_signal) then ()
   else begin
     reactive.disposed_signal := true;
     List.iter dispose_subscription !(reactive.upstream_subscriptions);
     reactive.upstream_subscriptions := [];
-    reactive.subscribers := []
+    let rec clear = function
+      | None -> ()
+      | Some subscriber ->
+          let next = subscriber.next in
+          subscriber.subscriber_disposed := true;
+          subscriber.callback <- ignore;
+          subscriber.previous <- None;
+          subscriber.next <- None;
+          clear next
+    in
+    clear reactive.subscribers.first;
+    reactive.subscribers.first <- None;
+    reactive.subscribers.last <- None
   end
 
 let publish reactive next_value =
   if not !(reactive.disposed_signal) then begin
     reactive.current := next_value;
+    let rec snapshot accumulated = function
+      | None -> List.rev accumulated
+      | Some subscriber -> snapshot (subscriber :: accumulated) subscriber.next
+    in
     List.iter
       (fun subscriber_value ->
         if not !(reactive.disposed_signal) then
           subscriber_value.callback next_value)
-      !(reactive.subscribers)
+      (snapshot [] reactive.subscribers.first)
   end
 
 let state owner initial =
@@ -359,8 +401,7 @@ let make_scope name =
   }
 
 let register_cleanup scope_value callback =
-  if !(scope_value.disposed_scope)
-  then begin
+  if !(scope_value.disposed_scope) then begin
     callback ();
     { disposed = ref true; cancel = (fun () -> ()) }
   end
@@ -368,10 +409,16 @@ let register_cleanup scope_value callback =
     incr scope_value.next_cleanup_id;
     let cleanup_id = !(scope_value.next_cleanup_id) in
     let disposed = ref false in
-    let entry = { cleanup_id; cleanup_callback = callback } in
+    let entry = {
+      cleanup_id;
+      cleanup_callback = (fun () ->
+        if not !disposed then begin
+          disposed := true;
+          callback ()
+        end);
+    } in
     let cancel () =
-      if !disposed
-      then ()
+      if !disposed then ()
       else begin
         disposed := true;
         scope_value.cleanup_callbacks :=
@@ -380,10 +427,18 @@ let register_cleanup scope_value callback =
             !(scope_value.cleanup_callbacks)
       end
     in
-    scope_value.cleanup_callbacks :=
-      !(scope_value.cleanup_callbacks) @ [ entry ];
+    scope_value.cleanup_callbacks := entry :: !(scope_value.cleanup_callbacks);
     { disposed; cancel }
   end
+
+let run_cleanups callbacks =
+  let first_error = ref None in
+  List.iter
+    (fun callback ->
+      try callback ()
+      with exn -> if !first_error = None then first_error := Some exn)
+    callbacks;
+  match !first_error with None -> () | Some exn -> raise exn
 
 let rec child_scope name parent =
   if !(parent.disposed_scope)
@@ -394,28 +449,39 @@ let rec child_scope name parent =
   child
 
 and own scope_value subscription =
-  if !(scope_value.disposed_scope)
-  then dispose_subscription subscription
+  if !(scope_value.disposed_scope) then dispose_subscription subscription
   else
     scope_value.owned_subscriptions :=
-      !(scope_value.owned_subscriptions) @ [ subscription ];
+      subscription :: !(scope_value.owned_subscriptions);
   subscription
 
 and dispose_scope scope_value =
-  if !(scope_value.disposed_scope)
-  then ()
+  if !(scope_value.disposed_scope) then ()
   else begin
     scope_value.disposed_scope := true;
-    List.iter
-      (fun cleanup -> cleanup.cleanup_callback ())
-      !(scope_value.cleanup_callbacks);
-    List.iter dispose_subscription !(scope_value.owned_subscriptions);
-    if !(scope_value.mounted)
-    then
-      List.iter (fun callback -> callback ()) !(scope_value.unmount_callbacks);
+    let cleanups = List.rev !(scope_value.cleanup_callbacks) in
+    let subscriptions = List.rev !(scope_value.owned_subscriptions) in
+    let unmounts =
+      if !(scope_value.mounted) then List.rev !(scope_value.unmount_callbacks)
+      else []
+    in
     scope_value.mounted := false;
     scope_value.cleanup_callbacks := [];
-    scope_value.owned_subscriptions := []
+    scope_value.owned_subscriptions := [];
+    scope_value.mount_callbacks := [];
+    scope_value.unmount_callbacks := [];
+    run_cleanups
+      [
+        (fun () ->
+          run_cleanups
+            (List.map (fun cleanup -> cleanup.cleanup_callback) cleanups));
+        (fun () ->
+          run_cleanups
+            (List.map
+               (fun subscription -> fun () -> dispose_subscription subscription)
+               subscriptions));
+        (fun () -> run_cleanups unmounts);
+      ]
   end
 
 let scope name = make_scope name
@@ -423,12 +489,12 @@ let scope name = make_scope name
 let on_mount scope_value callback =
   if !(scope_value.disposed_scope) then ()
   else if !(scope_value.mounted) then callback ()
-  else
-    scope_value.mount_callbacks := !(scope_value.mount_callbacks) @ [ callback ]
+  else scope_value.mount_callbacks := callback :: !(scope_value.mount_callbacks)
 
 let on_unmount scope_value callback =
-  scope_value.unmount_callbacks :=
-    !(scope_value.unmount_callbacks) @ [ callback ]
+  if not !(scope_value.disposed_scope) then
+    scope_value.unmount_callbacks :=
+      callback :: !(scope_value.unmount_callbacks)
 
 let on_dispose scope_value callback =
   ignore (register_cleanup scope_value callback)
@@ -438,11 +504,12 @@ let own_signal scope_value reactive =
   reactive
 
 let mount scope_value =
-  if !(scope_value.disposed_scope) || !(scope_value.mounted)
-  then ()
+  if !(scope_value.disposed_scope) || !(scope_value.mounted) then ()
   else begin
     scope_value.mounted := true;
-    List.iter (fun callback -> callback ()) !(scope_value.mount_callbacks)
+    let callbacks = List.rev !(scope_value.mount_callbacks) in
+    scope_value.mount_callbacks := [];
+    List.iter (fun callback -> callback ()) callbacks
   end
 
 let active scope_value =
@@ -571,71 +638,98 @@ let set_keyed_item item_state current =
   in
   if staged != current then set item_state current
 
-let reconcile_keyed scheduler entries_ref items key_fn compare mount_scope
-    on_patch =
+let remaining_counts size =
+  Array.init (size + 1) (fun index -> index land -index)
+
+let remaining_before counts index =
+  let rec loop index total =
+    if index = 0 then total
+    else loop (index - (index land -index)) (total + counts.(index))
+  in
+  loop index 0
+
+let remove_remaining counts index =
+  let rec loop index =
+    if index < Array.length counts then begin
+      counts.(index) <- counts.(index) - 1;
+      loop (index + (index land -index))
+    end
+  in
+  loop (index + 1)
+
+let reconcile_keyed (type key) scheduler
+    (entries_ref : (key, 'item) keyed_entry list ref) (items : 'item list)
+    (key_fn : 'item -> key) (compare : key -> key -> int) mount_scope on_patch =
+  let module Key_map = Map.Make (struct
+    type t = key
+
+    let compare = compare
+  end) in
   let new_index = key_index items key_fn compare in
-  let without_removed =
-    let rec loop index entries =
-      if index < 0 then entries
-      else
-        let entry = List.nth entries index in
-        let key = entry.entry_key in
-        match new_index key with
-        | Some _ -> loop (index - 1) entries
-        | None ->
-            on_patch (Remove (key, index));
-            dispose_scope entry.entry_scope;
-            loop (index - 1) (remove_entry_at entries index)
-    in
-    loop (List.length !entries_ref - 1) !entries_ref
+  let _, retained, removed =
+    List.fold_left
+      (fun (index, retained, removed) entry ->
+        match new_index entry.entry_key with
+        | Some _ -> (index + 1, entry :: retained, removed)
+        | None -> (index + 1, retained, (index, entry) :: removed))
+      (0, [], []) !entries_ref
   in
-  let items = Array.of_list items in
-  let nth_opt entries index =
-    if index < List.length entries then Some (List.nth entries index) else None
+  List.iter
+    (fun (index, entry) ->
+      on_patch (Remove (entry.entry_key, index));
+      dispose_scope entry.entry_scope)
+    removed;
+  let retained = List.rev retained in
+  let size, existing =
+    List.fold_left
+      (fun (index, entries) entry ->
+        (index + 1, Key_map.add entry.entry_key (index, entry) entries))
+      (0, Key_map.empty) retained
   in
-  let reconciled =
-    let rec loop index entries =
-      if index = Array.length items then entries
-      else
-        let current = items.(index) in
+  (* Unprocessed retained entries stay in their original order. A Fenwick tree
+     counts those before each key, giving the current Move index in O(log n)
+     without searching or repeatedly rebuilding the visible list. *)
+  let counts = remaining_counts size in
+  let rec loop index result = function
+    | [] -> List.rev result
+    | current :: rest ->
         let key = key_fn current in
-        match nth_opt entries index with
-        | Some entry when compare entry.entry_key key = 0 ->
-            set_keyed_item entry.entry_state current;
-            loop (index + 1) entries
-        | _ -> (
-            match find_entry_index entries key compare with
-            | Some existing_index ->
-                let entry = List.nth entries existing_index in
-                set_keyed_item entry.entry_state current;
-                on_patch (Move (key, existing_index, index));
-                loop (index + 1) (move_entry entries existing_index index)
-            | None ->
-                let item_state = state scheduler current in
-                let child = mount_scope (value item_state) in
-                let entry =
-                  {
-                    entry_key = key;
-                    entry_state = item_state;
-                    entry_scope = child;
-                  }
-                in
-                mount child;
-                on_patch (Insert (key, index));
-                loop (index + 1) (insert_entry_at entries index entry))
-    in
-    loop 0 without_removed
+        let entry =
+          match Key_map.find_opt key existing with
+          | Some (original_index, entry) ->
+              set_keyed_item entry.entry_state current;
+              let before = remaining_before counts original_index in
+              if before <> 0 then on_patch (Move (key, index + before, index));
+              remove_remaining counts original_index;
+              entry
+          | None ->
+              let item_state = state scheduler current in
+              let child = mount_scope (value item_state) in
+              ignore (own_signal child (value item_state));
+              let entry =
+                {
+                  entry_key = key;
+                  entry_state = item_state;
+                  entry_scope = child;
+                }
+              in
+              mount child;
+              on_patch (Insert (key, index));
+              entry
+        in
+        loop (index + 1) (entry :: result) rest
   in
-  entries_ref := reconciled
+  entries_ref := loop 0 [] items
 
 let dispose_keyed keyed_value =
   if !(keyed_value.keyed_disposed) then ()
   else begin
     keyed_value.keyed_disposed := true;
     dispose_subscription keyed_value.keyed_subscription;
-    List.iter
-      (fun entry -> dispose_scope entry.entry_scope)
-      !(keyed_value.keyed_entries)
+    run_cleanups
+      (List.map
+         (fun entry -> fun () -> dispose_scope entry.entry_scope)
+         !(keyed_value.keyed_entries))
   end
 
 let keyed parent source key_fn compare mount_scope on_patch =

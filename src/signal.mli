@@ -14,13 +14,16 @@ type stabilization_diagnostics = {
   stabilization_dirty_tasks : int;
 }
 
+(** FIFO computation queues indexed by dependency rank. *)
+type computation_queue
+
 (** Owns the effect, dirty-task, and computation queues shared by every signal created
     through it. Signals and scopes created on different schedulers must not be
     combined. *)
 type scheduler = {
-  effects : (unit -> unit) list ref;
-  dirty : (unit -> unit) list ref;
-  computations : (int * (unit -> unit)) list ref;
+  effects : (unit -> unit) Queue.t;
+  dirty : (unit -> unit) Queue.t;
+  computations : computation_queue ref;
   (** Derived tasks paired with their dependency rank. *)
   generation_value : int ref;
   last_stabilization_value : stabilization_diagnostics ref;
@@ -31,7 +34,16 @@ type scheduler = {
 type subscription = { disposed : bool ref; cancel : unit -> unit }
 
 (** A registered signal callback. *)
-type 'value subscriber = { subscriber_id : int; callback : 'value -> unit }
+type 'value subscriber = {
+  subscriber_id : int;
+  mutable callback : 'value -> unit;
+  subscriber_disposed : bool ref;
+  mutable previous : 'value subscriber option;
+  mutable next : 'value subscriber option;
+}
+
+(** Subscriber registry with constant-time registration and cancellation. *)
+type 'value subscribers
 
 (** A registered scope cleanup callback. *)
 type cleanup_entry = { cleanup_id : int; cleanup_callback : unit -> unit }
@@ -46,7 +58,7 @@ type 'value signal = {
   (** Dependency depth; constants and states have rank [0]. *)
   current : 'value ref;
   next_subscriber_id : int ref;
-  subscribers : 'value subscriber list ref;
+  subscribers : 'value subscribers;
   upstream_subscriptions : subscription list ref;
   disposed_signal : bool ref;
 }
@@ -191,6 +203,8 @@ val update : 'value state -> ('value -> 'value) -> unit
 (** [subscribe ?emit_initial sig callback] registers [callback] to run at
     every publish. When [emit_initial] is [true] (the default) the callback
     also runs synchronously with the current value.
+    If the initial callback raises, its registration is cancelled before the
+    exception propagates; other subscriptions remain registered.
     Raises [Invalid_argument] on a disposed signal. *)
 val subscribe : ?emit_initial:bool -> 'value signal -> ('value -> unit) -> subscription
 
@@ -244,7 +258,7 @@ val on_unmount : scope -> (unit -> unit) -> unit
 val on_dispose : scope -> (unit -> unit) -> unit
 
 (** [register_cleanup sc f] registers [f] and returns a {!subscription} that
-    cancels it. *)
+    cancels it, including cancellation by an earlier cleanup during disposal. *)
 val register_cleanup : scope -> (unit -> unit) -> subscription
 
 (** [own sc sub] ties [sub]'s lifetime to [sc]; on a disposed scope [sub] is
@@ -258,7 +272,9 @@ val own_signal : scope -> 'value signal -> 'value signal
 val mount : scope -> unit
 
 (** [dispose_scope sc] runs cleanups and unmount callbacks, cancels owned
-    subscriptions, and disposes child scopes; idempotent. *)
+    subscriptions, and disposes child scopes; idempotent. If a callback raises,
+    the remaining resources are still released before the first exception is
+    re-raised. *)
 val dispose_scope : scope -> unit
 
 (** [active sc] is [true] while [sc] is mounted and not disposed. *)
@@ -314,7 +330,9 @@ val move_entry : ('key, 'item) keyed_entry list -> int -> int -> ('key, 'item) k
     entries are repositioned ([Move] emitted on index change), and new keys
     are mounted and inserted ([Insert] emitted). Retained item values are
     compared with their pending value, if any, using physical equality; item
-    payloads may contain functions. Use {!cutoff} for custom value equality. *)
+    payloads may contain functions. Use {!cutoff} for custom value equality.
+    For [n = old_length + new_length], reconciliation uses [O(n log(n + 1))]
+    comparisons and [O(n)] auxiliary storage, excluding user callbacks. *)
 val reconcile_keyed : scheduler -> ('key, 'item) keyed_entry list ref -> 'item list -> ('item -> 'key) -> ('key -> 'key -> int) -> ('item signal -> scope) -> ('key keyed_patch -> unit) -> unit
 
 (** [keyed parent items_sig key_of compare mount on_patch] subscribes to

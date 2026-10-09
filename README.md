@@ -34,3 +34,29 @@ dune runtest
 ```
 
 The library builds for native, bytecode, and Melange.
+
+## Property testing and performance
+
+`dune runtest` runs the regression suite and 17 QCheck2 properties with seed
+24301: 6,140 generated cases covering staged writes, random DAGs and cutoffs,
+exception recovery, cancellation, scope/switch/slot lifetimes, keyed patch replay
+and identity, duplicate keys, and clamped list operations. Generators shrink
+failing inputs, and the reported seed makes failures reproducible.
+
+Properties also check exact recomputation/task counts, linear allocation budgets
+for queues, fanout, subscriptions, and scope lifetimes, and an `n log n`
+comparison budget for keyed reversal. CI runs a longer fixed-seed suite plus a
+seed derived from the workflow run ID. QCheck is a test-only dependency.
+
+```sh
+dune exec test/test_properties.exe -- --long --seed 24301 --no-colors
+dune exec test/test_properties.exe -- --seed 12345 --no-colors
+dune exec --profile release test/bench_signal.exe
+```
+
+The native benchmark reports median elapsed time and allocated words for FIFO
+work, wide/deep graphs, subscriptions, and keyed reversal, using three warmups
+and nine samples per size. It excludes graph construction and collects garbage
+before each measurement. Timing is reported separately from the CI properties;
+there are no machine-dependent timing thresholds. These measurements concern
+native OCaml, not Melange JavaScript execution.

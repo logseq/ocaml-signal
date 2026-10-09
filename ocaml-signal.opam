@@ -15,6 +15,7 @@ depends: [
   "dune" {>= "3.17" & >= "3.17"}
   "melange" {>= "6.0"}
   "alcotest" {with-test}
+  "qcheck-core" {with-test & >= "0.25"}
   "odoc" {with-doc}
 ]
 build: [
