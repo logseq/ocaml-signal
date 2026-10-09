@@ -14,12 +14,14 @@ type stabilization_diagnostics = {
   stabilization_dirty_tasks : int;
 }
 
-(** Owns the effect and dirty-task queues shared by every signal created
+(** Owns the effect, dirty-task, and computation queues shared by every signal created
     through it. Signals and scopes created on different schedulers must not be
     combined. *)
 type scheduler = {
   effects : (unit -> unit) list ref;
   dirty : (unit -> unit) list ref;
+  computations : (int * (unit -> unit)) list ref;
+  (** Derived tasks paired with their dependency rank. *)
   generation_value : int ref;
   last_stabilization_value : stabilization_diagnostics ref;
 }
@@ -40,6 +42,8 @@ type cleanup_entry = { cleanup_id : int; cleanup_callback : unit -> unit }
     notified when {!stabilize} publishes a new current value. *)
 type 'value signal = {
   owner : scheduler;
+  rank : int;
+  (** Dependency depth; constants and states have rank [0]. *)
   current : 'value ref;
   next_subscriber_id : int ref;
   subscribers : 'value subscriber list ref;
@@ -147,9 +151,12 @@ exception Stabilization_limit_exceeded of int * int * int
 val max_stabilization_rounds : int
 
 (** [stabilize owner] drains the effect and dirty queues to a fixpoint: each
-    round runs all queued effects, then all dirty tasks, repeating until both
-    queues are empty. Increments {!generation} and updates
-    {!last_stabilization} only when at least one task ran.
+    round runs all queued effects, then all dirty tasks. Once mutations settle,
+    derived signals recompute in dependency order, one rank per round, repeating
+    until all queues are empty. Unexecuted tasks are preserved if a callback
+    raises; the exception propagates to the caller. On successful completion,
+    increments {!generation} when at least one task ran and updates
+    {!last_stabilization}.
     @raise Stabilization_limit_exceeded on a runaway loop. *)
 val stabilize : scheduler -> unit
 
@@ -204,7 +211,7 @@ val dispose_signal : 'value signal -> unit
 val map : ('left -> 'output) -> 'left signal -> 'output signal
 
 (** [map2 f left right] derives a signal publishing [f] applied to the latest
-    values of both inputs. Both signals must share one scheduler.
+    settled values of both inputs. Both signals must share one scheduler.
     Raises [Invalid_argument] when the schedulers differ or either input is
     disposed. *)
 val map2 : ('left -> 'right -> 'output) -> 'left signal -> 'right signal -> 'output signal
@@ -270,7 +277,10 @@ val state_at : scheduler -> scope -> 'value state_slot -> 'value -> 'value state
 
 (** [switch parent key_sig equal mount] mounts [mount key] in a child scope of
     [parent] for the current key, and on each published change disposes the
-    previous scope and mounts a new one when [equal] reports the keys differ. *)
+    previous scope and mounts a new one when [equal] reports the keys differ.
+    Disposing [parent] disposes the switch and its current scope, even if
+    [mount] returns a root scope.
+    Raises [Invalid_argument] on a disposed parent. *)
 val switch : scope -> 'key signal -> ('key -> 'key -> bool) -> ('key -> scope) -> 'key switch
 
 (** [dispose_switch sw] disposes the switch and its current child scope;
@@ -302,13 +312,17 @@ val move_entry : ('key, 'item) keyed_entry list -> int -> int -> ('key, 'item) k
     diffs [items] against [entries_ref]: entries whose keys disappeared are
     removed (scope disposed, [Remove] emitted, greatest index first), kept
     entries are repositioned ([Move] emitted on index change), and new keys
-    are mounted and inserted ([Insert] emitted). *)
+    are mounted and inserted ([Insert] emitted). Retained item values are
+    compared with their pending value, if any, using physical equality; item
+    payloads may contain functions. Use {!cutoff} for custom value equality. *)
 val reconcile_keyed : scheduler -> ('key, 'item) keyed_entry list ref -> 'item list -> ('item -> 'key) -> ('key -> 'key -> int) -> ('item signal -> scope) -> ('key keyed_patch -> unit) -> unit
 
 (** [keyed parent items_sig key_of compare mount on_patch] subscribes to
     [items_sig] and reconciles each published list into per-key entries, each
     backed by a state and mounted scope, emitting {!keyed_patch} values to
-    [on_patch]. *)
+    [on_patch]. Disposing [parent] disposes the collection and its item scopes,
+    even if [mount] returns root scopes.
+    Raises [Invalid_argument] on a disposed parent. *)
 val keyed : scope -> 'item list signal -> ('item -> 'key) -> ('key -> 'key -> int) -> ('item signal -> scope) -> ('key keyed_patch -> unit) -> ('key, 'item) keyed
 
 (** [keyed_find_scope k key] is the scope of the entry with [key].

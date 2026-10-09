@@ -8,6 +8,7 @@ type stabilization_diagnostics = {
 type scheduler = {
   effects : (unit -> unit) list ref;
   dirty : (unit -> unit) list ref;
+  computations : (int * (unit -> unit)) list ref;
   generation_value : int ref;
   last_stabilization_value : stabilization_diagnostics ref;
 }
@@ -20,6 +21,7 @@ type cleanup_entry = { cleanup_id : int; cleanup_callback : unit -> unit }
 
 type 'value signal = {
   owner : scheduler;
+  rank : int;
   current : 'value ref;
   next_subscriber_id : int ref;
   subscribers : 'value subscriber list ref;
@@ -78,6 +80,7 @@ let scheduler () =
   {
     effects = ref [];
     dirty = ref [];
+    computations = ref [];
     generation_value = ref 0;
     last_stabilization_value =
       ref
@@ -107,6 +110,28 @@ let schedule_once owner scheduled task =
         task ())
   end
 
+let schedule_computation reactive scheduled task =
+  if not !scheduled then begin
+    scheduled := true;
+    reactive.owner.computations :=
+      !(reactive.owner.computations)
+      @ [
+          ( reactive.rank,
+            fun () ->
+              scheduled := false;
+              if not !(reactive.disposed_signal) then task () );
+        ]
+  end
+
+let rec run_tasks queue run = function
+  | [] -> ()
+  | task :: remaining ->
+      (try run task
+       with exn ->
+         queue := remaining @ !queue;
+         raise exn);
+      run_tasks queue run remaining
+
 let max_stabilization_rounds = 10000
 
 exception Stabilization_limit_exceeded of int * int * int
@@ -120,8 +145,8 @@ let stabilize owner =
   while !continue do
     let effects = !(owner.effects) in
     let dirty = !(owner.dirty) in
-    if effects = [] && dirty = []
-    then continue := false
+    if effects = [] && dirty = [] && !(owner.computations) = [] then
+      continue := false
     else begin
       worked := true;
       incr rounds;
@@ -129,13 +154,38 @@ let stabilize owner =
         raise
           (Stabilization_limit_exceeded
              (max_stabilization_rounds, !effect_count, !dirty_count));
-      effect_count := !effect_count + List.length effects;
       owner.effects := [];
-      List.iter (fun f -> f ()) effects;
+      run_tasks owner.effects
+        (fun f ->
+          incr effect_count;
+          f ())
+        effects;
       let pending_dirty = !(owner.dirty) in
-      dirty_count := !dirty_count + List.length pending_dirty;
       owner.dirty := [];
-      List.iter (fun task -> task ()) pending_dirty
+      run_tasks owner.dirty
+        (fun task ->
+          incr dirty_count;
+          task ())
+        pending_dirty;
+      if effects = [] && pending_dirty = [] && !(owner.computations) <> [] then begin
+        (* Settle mutations first, then recompute one dependency rank per round. *)
+        let rank =
+          List.fold_left
+            (fun lowest (rank, _) -> min lowest rank)
+            max_int !(owner.computations)
+        in
+        let ready, waiting =
+          List.partition
+            (fun (task_rank, _) -> task_rank = rank)
+            !(owner.computations)
+        in
+        owner.computations := waiting;
+        run_tasks owner.computations
+          (fun (_, task) ->
+            incr dirty_count;
+            task ())
+          ready
+      end
     end
   done;
   if !worked then incr owner.generation_value;
@@ -150,6 +200,7 @@ let stabilize owner =
 let constant owner initial =
   {
     owner;
+    rank = 0;
     current = ref initial;
     next_subscriber_id = ref 0;
     subscribers = ref [];
@@ -162,15 +213,16 @@ let sample reactive = !(reactive.current)
 let get = sample
 
 let subscribe ?(emit_initial = true) reactive callback =
-  if !(reactive.disposed_signal)
-  then invalid_arg "cannot observe a disposed signal";
+  if !(reactive.disposed_signal) then
+    invalid_arg "cannot observe a disposed signal";
   incr reactive.next_subscriber_id;
   let subscriber_id = !(reactive.next_subscriber_id) in
-  let subscriber_value = { subscriber_id; callback } in
   let disposed = ref false in
+  let subscriber_value =
+    { subscriber_id; callback = (fun v -> if not !disposed then callback v) }
+  in
   let cancel () =
-    if !disposed
-    then ()
+    if !disposed then ()
     else begin
       disposed := true;
       reactive.subscribers :=
@@ -198,11 +250,12 @@ let dispose_signal reactive =
   end
 
 let publish reactive next_value =
-  if not !(reactive.disposed_signal)
-  then begin
+  if not !(reactive.disposed_signal) then begin
     reactive.current := next_value;
     List.iter
-      (fun subscriber_value -> subscriber_value.callback next_value)
+      (fun subscriber_value ->
+        if not !(reactive.disposed_signal) then
+          subscriber_value.callback next_value)
       !(reactive.subscribers)
   end
 
@@ -235,44 +288,57 @@ let update state_value update_fn =
   set state_value (update_fn current)
 
 let map transform source =
-  let derived = constant source.owner (transform (sample source)) in
+  let derived =
+    {
+      (constant source.owner (transform (sample source))) with
+      rank = source.rank + 1;
+    }
+  in
   let scheduled = ref false in
   let subscription =
     subscribe ~emit_initial:false source (fun _current ->
-        schedule_once source.owner scheduled (fun () ->
-            if !(derived.disposed_signal)
-            then ()
-            else publish derived (transform (sample source))))
+        schedule_computation derived scheduled (fun () ->
+            publish derived (transform (sample source))))
   in
   derived.upstream_subscriptions :=
     !(derived.upstream_subscriptions) @ [ subscription ];
   derived
 
 let map2 transform left right =
-  if left.owner != right.owner
-  then invalid_arg "map inputs must share one scheduler";
+  if left.owner != right.owner then
+    invalid_arg "map inputs must share one scheduler";
   let derived =
-    constant left.owner (transform (sample left) (sample right))
+    {
+      (constant left.owner (transform (sample left) (sample right))) with
+      rank = max left.rank right.rank + 1;
+    }
   in
   let scheduled = ref false in
   let recompute _changed =
-    schedule_once left.owner scheduled (fun () ->
+    schedule_computation derived scheduled (fun () ->
         publish derived (transform (sample left) (sample right)))
   in
   derived.upstream_subscriptions :=
     !(derived.upstream_subscriptions)
-    @ [ subscribe ~emit_initial:false left recompute;
-        subscribe ~emit_initial:false right recompute ];
+    @ [
+        subscribe ~emit_initial:false left recompute;
+        subscribe ~emit_initial:false right recompute;
+      ];
   derived
 
 let cutoff equal source =
-  let derived = constant source.owner (sample source) in
+  let derived =
+    { (constant source.owner (sample source)) with rank = source.rank + 1 }
+  in
+  let scheduled = ref false in
   derived.upstream_subscriptions :=
     !(derived.upstream_subscriptions)
     @ [
-        subscribe ~emit_initial:false source (fun next_value ->
-            if not (equal (sample derived) next_value)
-            then publish derived next_value);
+        subscribe ~emit_initial:false source (fun _ ->
+            schedule_computation derived scheduled (fun () ->
+                let next_value = sample source in
+                if not (equal (sample derived) next_value) then
+                  publish derived next_value));
       ];
   derived
 
@@ -355,7 +421,10 @@ and dispose_scope scope_value =
 let scope name = make_scope name
 
 let on_mount scope_value callback =
-  scope_value.mount_callbacks := !(scope_value.mount_callbacks) @ [ callback ]
+  if !(scope_value.disposed_scope) then ()
+  else if !(scope_value.mounted) then callback ()
+  else
+    scope_value.mount_callbacks := !(scope_value.mount_callbacks) @ [ callback ]
 
 let on_unmount scope_value callback =
   scope_value.unmount_callbacks :=
@@ -395,7 +464,18 @@ let state_at scheduler scope_value slot initial =
         Hashtbl.remove slot.slot_states scope_id);
     created
 
+let dispose_switch switch_value =
+  if !(switch_value.switch_disposed)
+  then ()
+  else begin
+    switch_value.switch_disposed := true;
+    dispose_subscription switch_value.switch_subscription;
+    dispose_scope !(switch_value.switch_scope)
+  end
+
 let switch parent source equal mount_scope =
+  if !(parent.disposed_scope) then
+    invalid_arg "cannot switch in a disposed scope";
   let initial_key = sample source in
   let current_key = ref initial_key in
   let current_scope = ref (mount_scope initial_key) in
@@ -403,8 +483,7 @@ let switch parent source equal mount_scope =
   mount !current_scope;
   let subscription =
     subscribe ~emit_initial:false source (fun next_key ->
-        if !disposed || equal !current_key next_key
-        then ()
+        if !disposed || equal !current_key next_key then ()
         else begin
           dispose_scope !current_scope;
           let next_scope = mount_scope next_key in
@@ -420,17 +499,9 @@ let switch parent source equal mount_scope =
       switch_disposed = disposed;
     }
   in
-  ignore (own parent subscription);
+  ignore
+    (own parent { disposed; cancel = (fun () -> dispose_switch switch_value) });
   switch_value
-
-let dispose_switch switch_value =
-  if !(switch_value.switch_disposed)
-  then ()
-  else begin
-    switch_value.switch_disposed := true;
-    dispose_subscription switch_value.switch_subscription;
-    dispose_scope !(switch_value.switch_scope)
-  end
 
 let rec find_entry_index entries key compare index =
   match entries with
@@ -467,42 +538,54 @@ let remove_entry_at entries removed_index =
   List.filteri (fun index _entry -> index <> removed_index) entries
 
 let insert_entry_at entries inserted_index inserted =
+  let inserted_index = max 0 (min inserted_index (List.length entries)) in
   let rec loop index result remaining =
     match remaining with
     | [] ->
-      let result =
-        if inserted_index = index then inserted :: result else result
-      in
-      List.rev result
+        let result =
+          if inserted_index = index then inserted :: result else result
+        in
+        List.rev result
     | entry :: rest ->
-      let result =
-        if index = inserted_index then inserted :: result else result
-      in
-      loop (index + 1) (entry :: result) rest
+        let result =
+          if index = inserted_index then inserted :: result else result
+        in
+        loop (index + 1) (entry :: result) rest
   in
   loop 0 [] entries
 
 let move_entry entries from_index to_index =
-  let moving = List.nth entries from_index in
-  let without = remove_entry_at entries from_index in
-  insert_entry_at without to_index moving
+  match entries with
+  | [] -> []
+  | _ ->
+      let from_index = max 0 (min from_index (List.length entries - 1)) in
+      let moving = List.nth entries from_index in
+      let without = remove_entry_at entries from_index in
+      insert_entry_at without to_index moving
 
-let reconcile_keyed scheduler entries_ref items key_fn compare
-    mount_scope on_patch =
+let set_keyed_item item_state current =
+  let staged =
+    match !(item_state.pending) with
+    | Some pending -> pending
+    | None -> get_state item_state
+  in
+  if staged != current then set item_state current
+
+let reconcile_keyed scheduler entries_ref items key_fn compare mount_scope
+    on_patch =
   let new_index = key_index items key_fn compare in
   let without_removed =
     let rec loop index entries =
-      if index < 0
-      then entries
+      if index < 0 then entries
       else
         let entry = List.nth entries index in
         let key = entry.entry_key in
         match new_index key with
         | Some _ -> loop (index - 1) entries
         | None ->
-          on_patch (Remove (key, index));
-          dispose_scope entry.entry_scope;
-          loop (index - 1) (remove_entry_at entries index)
+            on_patch (Remove (key, index));
+            dispose_scope entry.entry_scope;
+            loop (index - 1) (remove_entry_at entries index)
     in
     loop (List.length !entries_ref - 1) !entries_ref
   in
@@ -512,49 +595,62 @@ let reconcile_keyed scheduler entries_ref items key_fn compare
   in
   let reconciled =
     let rec loop index entries =
-      if index = Array.length items
-      then entries
+      if index = Array.length items then entries
       else
         let current = items.(index) in
         let key = key_fn current in
         match nth_opt entries index with
         | Some entry when compare entry.entry_key key = 0 ->
-          if get_state entry.entry_state <> current
-          then set entry.entry_state current;
-          loop (index + 1) entries
+            set_keyed_item entry.entry_state current;
+            loop (index + 1) entries
         | _ -> (
-          match find_entry_index entries key compare with
-          | Some existing_index ->
-            let entry = List.nth entries existing_index in
-            if get_state entry.entry_state <> current
-            then set entry.entry_state current;
-            on_patch (Move (key, existing_index, index));
-            loop (index + 1) (move_entry entries existing_index index)
-          | None ->
-            let item_state = state scheduler current in
-            let child = mount_scope (value item_state) in
-            let entry =
-              { entry_key = key; entry_state = item_state; entry_scope = child }
-            in
-            mount child;
-            on_patch (Insert (key, index));
-            loop (index + 1) (insert_entry_at entries index entry))
+            match find_entry_index entries key compare with
+            | Some existing_index ->
+                let entry = List.nth entries existing_index in
+                set_keyed_item entry.entry_state current;
+                on_patch (Move (key, existing_index, index));
+                loop (index + 1) (move_entry entries existing_index index)
+            | None ->
+                let item_state = state scheduler current in
+                let child = mount_scope (value item_state) in
+                let entry =
+                  {
+                    entry_key = key;
+                    entry_state = item_state;
+                    entry_scope = child;
+                  }
+                in
+                mount child;
+                on_patch (Insert (key, index));
+                loop (index + 1) (insert_entry_at entries index entry))
     in
     loop 0 without_removed
   in
   entries_ref := reconciled
 
+let dispose_keyed keyed_value =
+  if !(keyed_value.keyed_disposed) then ()
+  else begin
+    keyed_value.keyed_disposed := true;
+    dispose_subscription keyed_value.keyed_subscription;
+    List.iter
+      (fun entry -> dispose_scope entry.entry_scope)
+      !(keyed_value.keyed_entries)
+  end
+
 let keyed parent source key_fn compare mount_scope on_patch =
+  if !(parent.disposed_scope) then
+    invalid_arg "cannot create a keyed collection in a disposed scope";
   let scheduler = source.owner in
   let initial_items = sample source in
   let entries_ref = ref [] in
-  reconcile_keyed scheduler entries_ref initial_items key_fn compare
-    mount_scope on_patch;
+  reconcile_keyed scheduler entries_ref initial_items key_fn compare mount_scope
+    on_patch;
   let disposed = ref false in
   let subscription =
     subscribe ~emit_initial:false source (fun items ->
-        reconcile_keyed scheduler entries_ref items key_fn compare
-          mount_scope on_patch)
+        reconcile_keyed scheduler entries_ref items key_fn compare mount_scope
+          on_patch)
   in
   let keyed_value =
     {
@@ -564,7 +660,8 @@ let keyed parent source key_fn compare mount_scope on_patch =
       keyed_disposed = disposed;
     }
   in
-  ignore (own parent subscription);
+  ignore
+    (own parent { disposed; cancel = (fun () -> dispose_keyed keyed_value) });
   keyed_value
 
 let keyed_find_scope keyed_value key =
@@ -572,19 +669,8 @@ let keyed_find_scope keyed_value key =
     match entries with
     | [] -> invalid_arg "keyed scope not found"
     | entry :: rest ->
-      if keyed_value.keyed_compare entry.entry_key key = 0
-      then entry.entry_scope
-      else loop rest
+        if keyed_value.keyed_compare entry.entry_key key = 0 then
+          entry.entry_scope
+        else loop rest
   in
   loop !(keyed_value.keyed_entries)
-
-let dispose_keyed keyed_value =
-  if !(keyed_value.keyed_disposed)
-  then ()
-  else begin
-    keyed_value.keyed_disposed := true;
-    dispose_subscription keyed_value.keyed_subscription;
-    List.iter
-      (fun entry -> dispose_scope entry.entry_scope)
-      !(keyed_value.keyed_entries)
-  end

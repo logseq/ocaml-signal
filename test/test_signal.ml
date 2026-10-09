@@ -455,6 +455,328 @@ let test_keyed_find_scope_missing_raises () =
   check_bool "missing keyed scope raises" true rejected;
   dispose_keyed keyed
 
+let test_stabilization_recovers_after_observer_exception () =
+  let owner = scheduler () in
+  let first = state owner 0 in
+  let second = state owner 0 in
+  let derived = map (fun v -> v * 2) (value second) in
+  ignore
+    (subscribe ~emit_initial:false (value first) (fun _ -> failwith "observer"));
+  set first 1;
+  set second 1;
+  (match stabilize owner with
+  | () -> Alcotest.fail "observer exception must propagate"
+  | exception Failure message ->
+      Alcotest.(check string) "exception" "observer" message);
+  set second 2;
+  stabilize owner;
+  check_int "remaining state task survives" 2 (get_state second);
+  check_int "dependent graph recovers" 4 (get derived)
+
+let test_stabilization_recovers_after_effect_exception () =
+  let owner = scheduler () in
+  let trace = ref [] in
+  enqueue_effect owner (fun () ->
+      enqueue_effect owner (fun () -> trace := !trace @ [ "new" ]);
+      failwith "effect");
+  enqueue_effect owner (fun () -> trace := !trace @ [ "remaining" ]);
+  (match stabilize owner with
+  | () -> Alcotest.fail "effect exception must propagate"
+  | exception Failure _ -> ());
+  stabilize owner;
+  check "remaining effects retain FIFO order" [ "remaining"; "new" ] !trace
+
+let test_stabilization_recovers_after_transform_exception () =
+  let owner = scheduler () in
+  let input = state owner 0 in
+  let should_raise = ref true in
+  ignore
+    (map
+       (fun v -> if v = 1 && !should_raise then failwith "transform" else v)
+       (value input));
+  let derived = map (fun v -> v * 2) (value input) in
+  set input 1;
+  (match stabilize owner with
+  | () -> Alcotest.fail "transform exception must propagate"
+  | exception Failure _ -> ());
+  should_raise := false;
+  stabilize owner;
+  check_int "remaining derived task survives" 2 (get derived);
+  set input 2;
+  stabilize owner;
+  check_int "later derived writes still work" 4 (get derived)
+
+let test_cancellation_during_notification () =
+  let owner = scheduler () in
+  let input = state owner 0 in
+  let later = ref None in
+  ignore
+    (subscribe ~emit_initial:false (value input) (fun _ ->
+         Option.iter dispose_subscription !later));
+  let calls = ref 0 in
+  later :=
+    Some (subscribe ~emit_initial:false (value input) (fun _ -> incr calls));
+  set input 1;
+  stabilize owner;
+  check_int "cancelled callback is skipped in the current publication" 0 !calls
+
+let test_signal_disposal_during_notification () =
+  let owner = scheduler () in
+  let input = state owner 0 in
+  ignore
+    (subscribe ~emit_initial:false (value input) (fun _ ->
+         dispose_signal (value input)));
+  let calls = ref 0 in
+  ignore (subscribe ~emit_initial:false (value input) (fun _ -> incr calls));
+  set input 1;
+  stabilize owner;
+  check_int "signal disposal stops the current publication" 0 !calls
+
+let test_keyed_parent_disposal_during_notification () =
+  let owner = scheduler () in
+  let parent = scope "parent" in
+  let input = state owner [ 1 ] in
+  ignore
+    (subscribe ~emit_initial:false (value input) (fun _ -> dispose_scope parent));
+  let mounts = ref 0 in
+  ignore
+    (keyed parent (value input) Fun.id Int.compare
+       (fun item ->
+         incr mounts;
+         child_scope (string_of_int (get item)) parent)
+       (fun _ -> ()));
+  set input [ 1; 2 ];
+  stabilize owner;
+  check_int "cancelled collection does not mount another child" 1 !mounts
+
+let test_map2_waits_for_deeper_inputs () =
+  let owner = scheduler () in
+  let input = state owner 1 in
+  let doubled = map (fun v -> v * 2) (value input) in
+  let indirect = map Fun.id doubled in
+  let calls = ref 0 in
+  let joined =
+    map2
+      (fun a b ->
+        incr calls;
+        a + b)
+      (value input) indirect
+  in
+  let seen = ref [] in
+  ignore (subscribe ~emit_initial:false joined (fun v -> seen := !seen @ [ v ]));
+  set input 2;
+  stabilize owner;
+  Alcotest.(check (list int)) "only settled values are published" [ 6 ] !seen;
+  check_int "one recomputation per batch" 2 !calls
+
+let test_map2_settles_diamond_with_cutoff () =
+  List.iter
+    (fun reverse ->
+      let owner = scheduler () in
+      let input = state owner 1 in
+      let shallow = cutoff ( = ) (value input) in
+      let deep = map (fun v -> v * 2) (map Fun.id (value input)) in
+      let joined =
+        if reverse then map2 ( + ) deep shallow else map2 ( + ) shallow deep
+      in
+      let seen = ref [] in
+      ignore
+        (subscribe ~emit_initial:false joined (fun v -> seen := !seen @ [ v ]));
+      set input 2;
+      stabilize owner;
+      Alcotest.(check (list int))
+        "cutoff and input order do not introduce glitches" [ 6 ] !seen)
+    [ false; true ]
+
+let test_disposed_map2_skips_queued_transform () =
+  let owner = scheduler () in
+  let input = state owner 0 in
+  let calls = ref 0 in
+  let derived =
+    map2
+      (fun a b ->
+        incr calls;
+        a + b)
+      (value input) (constant owner 1)
+  in
+  ignore
+    (subscribe ~emit_initial:false (value input) (fun _ ->
+         dispose_signal derived));
+  set input 1;
+  stabilize owner;
+  check_int "disposed queued transform does not run" 1 !calls;
+  check_int "disposed signal keeps its final value" 1 (get derived)
+
+let test_late_on_mount () =
+  let sc = scope "mounted" in
+  let calls = ref 0 in
+  mount sc;
+  on_mount sc (fun () -> incr calls);
+  check_int "late mount callback runs immediately" 1 !calls;
+  mount sc;
+  check_int "mount callback runs once" 1 !calls;
+  dispose_scope sc;
+  on_mount sc (fun () -> incr calls);
+  mount sc;
+  check_int "disposed scopes never run mount callbacks" 1 !calls
+
+let test_switch_owned_by_parent () =
+  let owner = scheduler () in
+  let parent = scope "parent" in
+  let input = state owner 0 in
+  let unmounts = ref 0 in
+  let sw =
+    switch parent (value input) ( = ) (fun _ ->
+        let sc = scope "branch" in
+        on_unmount sc (fun () -> incr unmounts);
+        sc)
+  in
+  set input 1;
+  stabilize owner;
+  dispose_scope parent;
+  check_bool "parent disposes the current branch" false
+    (active !(sw.switch_scope));
+  dispose_switch sw;
+  check_int "both branches unmount exactly once" 2 !unmounts
+
+let test_keyed_owned_by_parent () =
+  let owner = scheduler () in
+  let parent = scope "parent" in
+  let input = state owner [ 1; 2 ] in
+  let unmounts = ref 0 in
+  let collection =
+    keyed parent (value input) Fun.id Int.compare
+      (fun _ ->
+        let sc = scope "item" in
+        on_unmount sc (fun () -> incr unmounts);
+        sc)
+      (fun _ -> ())
+  in
+  let first = keyed_find_scope collection 1 in
+  let second = keyed_find_scope collection 2 in
+  dispose_scope parent;
+  check_bool "first item is inactive" false (active first);
+  check_bool "second item is inactive" false (active second);
+  dispose_keyed collection;
+  check_int "items unmount exactly once" 2 !unmounts
+
+let test_collections_reject_disposed_parents () =
+  let owner = scheduler () in
+  let parent = scope "disposed" in
+  dispose_scope parent;
+  let mounts = ref 0 in
+  check_bool "switch rejects a disposed parent" true
+    (raises_invalid_arg (fun () ->
+         ignore
+           (switch parent (constant owner 0) ( = ) (fun _ ->
+                incr mounts;
+                scope "branch"))));
+  check_bool "keyed rejects a disposed parent" true
+    (raises_invalid_arg (fun () ->
+         ignore
+           (keyed parent (constant owner [ 1 ]) Fun.id Int.compare
+              (fun _ ->
+                incr mounts;
+                scope "item")
+              (fun _ -> ()))));
+  check_int "invalid parents do not mount children" 0 !mounts
+
+let test_keyed_pending_item_update () =
+  List.iter
+    (fun reorder ->
+      let owner = scheduler () in
+      let parent = scope "parent" in
+      let original = [ item "a" 1; item "b" 1 ] in
+      let input = state owner original in
+      ignore
+        (subscribe ~emit_initial:false (value input) (fun items ->
+             if List.exists (fun i -> i.item_value = 2) items then
+               set input original));
+      let signals = ref [] in
+      ignore
+        (keyed parent (value input)
+           (fun i -> i.key)
+           String.compare
+           (fun signal ->
+             signals := signal :: !signals;
+             scope (get signal).key)
+           (fun _ -> ()));
+      let updated = [ item "a" 2; item "b" 2 ] in
+      set input (if reorder then List.rev updated else updated);
+      stabilize owner;
+      List.iter
+        (fun signal ->
+          check_int "item matches reverted source" 1 (get signal).item_value)
+        !signals)
+    [ false; true ]
+
+let test_keyed_function_payloads () =
+  let owner = scheduler () in
+  let parent = scope "parent" in
+  let input = state owner [ ("a", fun () -> 1); ("b", fun () -> 2) ] in
+  let signals = ref [] in
+  let collection =
+    keyed parent (value input) fst String.compare
+      (fun signal ->
+        signals := (fst (get signal), signal) :: !signals;
+        scope (fst (get signal)))
+      (fun _ -> ())
+  in
+  set input [ ("a", fun () -> 10); ("b", fun () -> 20) ];
+  stabilize owner;
+  check_int "retained callback payload updates" 10
+    (snd (get (List.assoc "a" !signals)) ());
+  set input [ ("b", fun () -> 200); ("a", fun () -> 100) ];
+  stabilize owner;
+  check_int "moved callback payload updates" 200
+    (snd (get (List.assoc "b" !signals)) ());
+  check_int "another retained callback payload updates" 100
+    (snd (get (List.assoc "a" !signals)) ());
+  dispose_keyed collection
+
+let test_insert_entry_clamps_indices () =
+  let owner = scheduler () in
+  let entry key =
+    { entry_key = key; entry_state = state owner key; entry_scope = scope key }
+  in
+  let entries = [ entry "a"; entry "b" ] in
+  let keys entries = List.map (fun e -> e.entry_key) entries in
+  List.iter
+    (fun (index, expected) ->
+      check "clamped insertion" expected
+        (keys (insert_entry_at entries index (entry "c"))))
+    [
+      (-1, [ "c"; "a"; "b" ]);
+      (0, [ "c"; "a"; "b" ]);
+      (1, [ "a"; "c"; "b" ]);
+      (2, [ "a"; "b"; "c" ]);
+      (100, [ "a"; "b"; "c" ]);
+    ];
+  check "empty insertion clamps" [ "c" ]
+    (keys (insert_entry_at [] 100 (entry "c")))
+
+let test_move_entry_clamps_indices () =
+  let owner = scheduler () in
+  let entry key =
+    { entry_key = key; entry_state = state owner key; entry_scope = scope key }
+  in
+  let entries = [ entry "a"; entry "b"; entry "c" ] in
+  let keys entries = List.map (fun e -> e.entry_key) entries in
+  List.iter
+    (fun (from_index, to_index, expected) ->
+      check "clamped movement preserves every entry" expected
+        (keys (move_entry entries from_index to_index)))
+    [
+      (0, 100, [ "b"; "c"; "a" ]);
+      (2, -1, [ "c"; "a"; "b" ]);
+      (-1, 2, [ "b"; "c"; "a" ]);
+      (100, 0, [ "c"; "a"; "b" ]);
+      (1, 1, [ "a"; "b"; "c" ]);
+    ];
+  check "empty movement is a no-op" [] (keys (move_entry [] 100 (-1)));
+  check "singleton movement preserves its entry" [ "a" ]
+    (keys (move_entry [ entry "a" ] 100 (-1)))
+
 let () =
   Alcotest.run "ocaml-signal"
     [
@@ -495,5 +817,38 @@ let () =
             `Quick test_own_on_disposed_scope_disposes_subscription;
           Alcotest.test_case "keyed find scope missing raises" `Quick
             test_keyed_find_scope_missing_raises;
+          Alcotest.test_case "recovery after observer exception" `Quick
+            test_stabilization_recovers_after_observer_exception;
+          Alcotest.test_case "recovery after effect exception" `Quick
+            test_stabilization_recovers_after_effect_exception;
+          Alcotest.test_case "recovery after transform exception" `Quick
+            test_stabilization_recovers_after_transform_exception;
+          Alcotest.test_case "cancellation during notification" `Quick
+            test_cancellation_during_notification;
+          Alcotest.test_case "signal disposal during notification" `Quick
+            test_signal_disposal_during_notification;
+          Alcotest.test_case "keyed parent disposal during notification" `Quick
+            test_keyed_parent_disposal_during_notification;
+          Alcotest.test_case "map2 waits for deeper inputs" `Quick
+            test_map2_waits_for_deeper_inputs;
+          Alcotest.test_case "map2 diamond with cutoff" `Quick
+            test_map2_settles_diamond_with_cutoff;
+          Alcotest.test_case "disposed map2 skips queued transform" `Quick
+            test_disposed_map2_skips_queued_transform;
+          Alcotest.test_case "late on_mount" `Quick test_late_on_mount;
+          Alcotest.test_case "switch owned by parent" `Quick
+            test_switch_owned_by_parent;
+          Alcotest.test_case "keyed owned by parent" `Quick
+            test_keyed_owned_by_parent;
+          Alcotest.test_case "collections reject disposed parents" `Quick
+            test_collections_reject_disposed_parents;
+          Alcotest.test_case "keyed pending item update" `Quick
+            test_keyed_pending_item_update;
+          Alcotest.test_case "keyed function payloads" `Quick
+            test_keyed_function_payloads;
+          Alcotest.test_case "insert entry clamps indices" `Quick
+            test_insert_entry_clamps_indices;
+          Alcotest.test_case "move entry clamps indices" `Quick
+            test_move_entry_clamps_indices;
         ] );
     ]
