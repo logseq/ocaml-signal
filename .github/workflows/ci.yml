@@ -19,7 +19,21 @@ jobs:
         uses: ocaml/setup-ocaml@v3
         with:
           ocaml-compiler: "5"
+          cache: true
           dune-cache: true
+
+      - name: Get dependency cache key
+        id: toolchain
+        run: |
+          echo "ocaml=$(opam exec -- ocamlc -version)" >> "$GITHUB_OUTPUT"
+          echo "opam=$(opam --version)" >> "$GITHUB_OUTPUT"
+          echo "month=$(date -u +%Y-%m)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache installed opam dependencies
+        uses: actions/cache@v4
+        with:
+          path: _opam
+          key: opam-deps-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.ocaml }}-${{ steps.toolchain.outputs.opam }}-${{ steps.toolchain.outputs.month }}-${{ hashFiles('*.opam', 'dune-project', '.github/workflows/ci.yml') }}
 
       - name: Install dependencies
         run: |
