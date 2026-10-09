@@ -2,3 +2,14 @@
  (name test_signal)
  (modules test_signal)
  (libraries ocaml-signal alcotest))
+
+(test
+ (name test_properties)
+ (modules test_properties)
+ (libraries ocaml-signal qcheck-core qcheck-core.runner)
+ (action (run %{test} --seed 24301 --no-colors)))
+
+(executable
+ (name bench_signal)
+ (modules bench_signal)
+ (libraries ocaml-signal unix))
