@@ -1,0 +1,10 @@
+(rule
+ (target test_runtime.ml)
+ (deps ../test_runtime.ml)
+ (action (copy %{deps} %{target})))
+
+(melange.emit
+ (target js)
+ (modules test_runtime)
+ (libraries ocaml-signal)
+ (module_systems commonjs))

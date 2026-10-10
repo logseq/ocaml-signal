@@ -9,6 +9,23 @@
  (libraries ocaml-signal qcheck-core qcheck-core.runner)
  (action (run %{test} --seed 24301 --no-colors)))
 
+(test
+ (name test_runtime)
+ (modules test_runtime)
+ (modes byte exe)
+ (libraries ocaml-signal))
+
+(test
+ (name test_cleanup_complexity)
+ (modules test_cleanup_complexity)
+ (libraries ocaml-signal))
+
+(test
+ (name test_registry_gc)
+ (modules test_registry_gc)
+ (modes byte exe)
+ (libraries ocaml-signal))
+
 (executable
  (name bench_signal)
  (modules bench_signal)

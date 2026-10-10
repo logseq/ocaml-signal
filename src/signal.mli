@@ -73,6 +73,13 @@ type 'value state = {
 
 (** {1 Scopes} *)
 
+(** Private accounting for bounded deferred removal of cancelled handles. *)
+type scope_registry
+
+(** Creates fresh accounting for a manually constructed {!scope} record.
+    Prefer {!val-scope} or {!make_scope}; do not share a registry across scopes. *)
+val make_scope_registry : unit -> scope_registry
+
 (** Lifecycle boundary for subscriptions, signals, cleanups, and per-scope
     state slots. Disposing a scope disposes everything it owns. *)
 type scope = {
@@ -83,6 +90,10 @@ type scope = {
   mount_callbacks : (unit -> unit) list ref;
   unmount_callbacks : (unit -> unit) list ref;
   owned_subscriptions : subscription list ref;
+  registry : scope_registry;
+  (** Internal accounting. The list fields may contain cancelled empty nodes;
+      use {!scope_cleanup_count} and {!scope_owned_count} for live counts.
+      Treat lifecycle record fields as read-only. *)
   mounted : bool ref;
   disposed_scope : bool ref;
 }
@@ -169,6 +180,8 @@ val max_stabilization_rounds : int
     raises; the exception propagates to the caller. On successful completion,
     increments {!generation} when at least one task ran and updates
     {!last_stabilization}.
+    A synchronous nested call on the same scheduler returns immediately;
+    the outer call drains any newly queued work. Other schedulers may be flushed.
     @raise Stabilization_limit_exceeded on a runaway loop. *)
 val stabilize : scheduler -> unit
 
@@ -205,6 +218,8 @@ val update : 'value state -> ('value -> 'value) -> unit
     also runs synchronously with the current value.
     If the initial callback raises, its registration is cancelled before the
     exception propagates; other subscriptions remain registered.
+    During publication, remaining live subscribers are notified even if an
+    earlier callback raises; the first exception is then propagated.
     Raises [Invalid_argument] on a disposed signal. *)
 val subscribe : ?emit_initial:bool -> 'value signal -> ('value -> unit) -> subscription
 
@@ -246,6 +261,12 @@ val child_scope : string -> scope -> scope
 (** [make_scope name] is {!val-scope}; kept for API parity. *)
 val make_scope : string -> scope
 
+(** Number of live cleanup registrations; constant time. *)
+val scope_cleanup_count : scope -> int
+
+(** Number of live owned handles; linear in the stored handle list. *)
+val scope_owned_count : scope -> int
+
 (** [on_mount sc f] runs [f] when [sc] mounts; if already mounted, runs [f]
     immediately. *)
 val on_mount : scope -> (unit -> unit) -> unit
@@ -258,7 +279,11 @@ val on_unmount : scope -> (unit -> unit) -> unit
 val on_dispose : scope -> (unit -> unit) -> unit
 
 (** [register_cleanup sc f] registers [f] and returns a {!subscription} that
-    cancels it, including cancellation by an earlier cleanup during disposal. *)
+    cancels it, including cancellation by an earlier cleanup during disposal.
+    Cancellation immediately releases [f]'s captured resources. Cancelled empty
+    nodes are compacted when at least half the list is dead, giving amortized
+    constant-time cancellation and at most twice as many stored nodes as live
+    registrations. *)
 val register_cleanup : scope -> (unit -> unit) -> subscription
 
 (** [own sc sub] ties [sub]'s lifetime to [sc]; on a disposed scope [sub] is
@@ -296,7 +321,12 @@ val state_at : scheduler -> scope -> 'value state_slot -> 'value -> 'value state
     previous scope and mounts a new one when [equal] reports the keys differ.
     Disposing [parent] disposes the switch and its current scope, even if
     [mount] returns a root scope.
-    Raises [Invalid_argument] on a disposed parent. *)
+    Raises [Invalid_argument] on a disposed parent or source. Construction
+    failure releases scopes returned by [mount]. If [mount] raises before
+    returning a scope, it must release any resources it created itself.
+    A later publication retries a branch whose previous mount failed.
+    Publications during construction or replacement are coalesced and handled
+    after the current factory and mount callbacks finish. *)
 val switch : scope -> 'key signal -> ('key -> 'key -> bool) -> ('key -> scope) -> 'key switch
 
 (** [dispose_switch sw] disposes the switch and its current child scope;
@@ -331,6 +361,12 @@ val move_entry : ('key, 'item) keyed_entry list -> int -> int -> ('key, 'item) k
     are mounted and inserted ([Insert] emitted). Retained item values are
     compared with their pending value, if any, using physical equality; item
     payloads may contain functions. Use {!cutoff} for custom value equality.
+    Callback failures release failed mounts and finish the internal edit before
+    propagating the first exception. Patch consumers must resynchronize their
+    external representation after a failing [on_patch]; external side effects
+    cannot be rolled back by the runtime. Key functions and comparators should
+    be pure and stable. Recursive reconciliation of the same [entries_ref] is
+    rejected with [Invalid_argument].
     For [n = old_length + new_length], reconciliation uses [O(n log(n + 1))]
     comparisons and [O(n)] auxiliary storage, excluding user callbacks. *)
 val reconcile_keyed : scheduler -> ('key, 'item) keyed_entry list ref -> 'item list -> ('item -> 'key) -> ('key -> 'key -> int) -> ('item signal -> scope) -> ('key keyed_patch -> unit) -> unit
@@ -340,7 +376,9 @@ val reconcile_keyed : scheduler -> ('key, 'item) keyed_entry list ref -> 'item l
     backed by a state and mounted scope, emitting {!keyed_patch} values to
     [on_patch]. Disposing [parent] disposes the collection and its item scopes,
     even if [mount] returns root scopes.
-    Raises [Invalid_argument] on a disposed parent. *)
+    Raises [Invalid_argument] on a disposed parent or source. Construction
+    failure disposes resources already created. Disposing the collection from
+    its callbacks stops the edit and releases in-flight item scopes. *)
 val keyed : scope -> 'item list signal -> ('item -> 'key) -> ('key -> 'key -> int) -> ('item signal -> scope) -> ('key keyed_patch -> unit) -> ('key, 'item) keyed
 
 (** [keyed_find_scope k key] is the scope of the entry with [key].
@@ -348,5 +386,6 @@ val keyed : scope -> 'item list signal -> ('item -> 'key) -> ('key -> 'key -> in
 val keyed_find_scope : ('key, 'item) keyed -> 'key -> scope
 
 (** [dispose_keyed k] cancels the reconciliation subscription and disposes all
-    entry scopes; idempotent. *)
+    entry scopes, clears retained entries, and unregisters its owner handle;
+    idempotent. A disposed collection has no scopes to find. *)
 val dispose_keyed : ('key, 'item) keyed -> unit

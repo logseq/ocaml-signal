@@ -43,11 +43,19 @@ jobs:
       - name: Build
         run: opam exec -- dune build
 
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
       - name: Test
         env:
           PROPERTY_SEED: ${{ github.run_id }}
         run: |
           opam exec -- dune runtest
+          opam exec -- dune exec test/test_runtime.bc
+          opam exec -- dune exec test/test_registry_gc.bc
+          node _build/default/test/melange/js/test/melange/test_runtime.js
           opam exec -- dune exec test/test_properties.exe -- --long --seed 24301 --no-colors
           opam exec -- dune exec test/test_properties.exe -- --seed "$PROPERTY_SEED" --no-colors
 
