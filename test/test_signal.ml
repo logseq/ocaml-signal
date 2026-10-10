@@ -259,7 +259,7 @@ let test_switch_lifecycle () =
   in
   check "initial switch branch" [ "mount-loading" ] !trace;
   check_int "parent owns only the active switch branch" 1
-    (List.length !(parent.cleanup_callbacks));
+    (scope_cleanup_count parent);
   set selected false;
   stabilize scheduler;
   check "equal key does not remount" [ "mount-loading" ] !trace;
@@ -269,10 +269,10 @@ let test_switch_lifecycle () =
     [ "mount-loading"; "unmount-loading"; "mount-content" ]
     !trace;
   check_int "replaced branch detaches from its parent" 1
-    (List.length !(parent.cleanup_callbacks));
+    (scope_cleanup_count parent);
   dispose_switch switch;
   check_int "disposed switch leaves no retained branch" 0
-    (List.length !(parent.cleanup_callbacks));
+    (scope_cleanup_count parent);
   check "switch disposal unmounts active branch"
     [ "mount-loading"; "unmount-loading"; "mount-content"; "unmount-content" ]
     !trace
@@ -304,7 +304,7 @@ let test_keyed_collection () =
   in
   check_int "initial keyed insert count" 3 (List.length !patches);
   check_int "parent owns the visible keyed scopes" 3
-    (List.length !(parent.cleanup_callbacks));
+    (scope_cleanup_count parent);
   check "keyed items expose initial values" [ "a:1"; "b:2"; "c:3" ] !updates;
   (match List.nth !patches 0 with
    | Insert (key, index) ->
@@ -342,7 +342,7 @@ let test_keyed_collection () =
   stabilize scheduler;
   check_int "keyed update patch count" 2 (List.length !patches);
   check_int "removed keyed scopes detach from their parent" 3
-    (List.length !(parent.cleanup_callbacks));
+    (scope_cleanup_count parent);
   (match List.nth !patches 0 with
    | Remove (key, index) ->
      Alcotest.(check string) "removed key" "b" key;
@@ -356,7 +356,7 @@ let test_keyed_collection () =
   check "removed scope is disposed" [ "b" ] !unmounted;
   dispose_keyed keyed;
   check_int "keyed disposal leaves no retained child scopes" 0
-    (List.length !(parent.cleanup_callbacks));
+    (scope_cleanup_count parent);
   check "keyed disposal follows visible order" [ "b"; "c"; "d"; "a" ] !unmounted
 
 let test_keyed_duplicates () =

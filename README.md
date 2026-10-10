@@ -35,10 +35,40 @@ dune runtest
 
 The library builds for native, bytecode, and Melange.
 
+## Scope record migration
+
+`scope` now contains an opaque `registry : scope_registry` field. Existing
+function signatures are unchanged. Prefer `Signal.scope name` or
+`Signal.make_scope name`; code that manually initializes the record must add
+`registry = Signal.make_scope_registry ()` with a fresh registry for each scope.
+Keep the existing unique scope id and fresh reference fields. Do not share
+registries between scopes or mutate lifecycle record fields directly.
+
+`cleanup_callbacks` and `owned_subscriptions` retain their list types, but may
+temporarily contain cancelled empty nodes. Replace
+`List.length !(sc.cleanup_callbacks)` with `Signal.scope_cleanup_count sc`
+(constant time), and use `Signal.scope_owned_count sc` for live owned handles
+(a linear scan). Cleanup cancellation immediately releases the callback's
+captured resources. Removing a switch or keyed lifetime similarly clears the
+owner's captured collection. Empty nodes are compacted when half of the stored
+registrations have been cancelled, avoiding a full list copy on every removal.
+The cleanup list contains at most twice as many nodes as live registrations,
+and registry metadata shrinks with that live count. Ordinary subscriptions passed
+to `own` remain owned until scope disposal; cancelling the original subscription
+does not by itself remove its owner node. `scope_owned_count` excludes it.
+
+Subscriber failures notify the remaining live subscribers before propagating
+the first exception; call `stabilize` again to drain queued dependent work.
+Nested `stabilize` calls on the same scheduler leave work to the outer flush.
+Keyed callback failures finish resource accounting before propagating the first
+exception, but external patch side effects cannot be rolled back: patch consumers
+must resynchronize after a failed callback. Factories that raise before returning
+a scope are responsible for releasing their own unreturned resources.
+
 ## Property testing and performance
 
-`dune runtest` runs the regression suite and 17 QCheck2 properties with seed
-24301: 6,140 generated cases covering staged writes, random DAGs and cutoffs,
+`dune runtest` runs the regression suite and 19 QCheck2 properties with seed
+24301: 7,140 generated cases covering staged writes, random DAGs and cutoffs,
 exception recovery, cancellation, scope/switch/slot lifetimes, keyed patch replay
 and identity, duplicate keys, and clamped list operations. Generators shrink
 failing inputs, and the reported seed makes failures reproducible.
@@ -46,7 +76,11 @@ failing inputs, and the reported seed makes failures reproducible.
 Properties also check exact recomputation/task counts, linear allocation budgets
 for queues, fanout, subscriptions, and scope lifetimes, and an `n log n`
 comparison budget for keyed reversal. CI runs a longer fixed-seed suite plus a
-seed derived from the workflow run ID. QCheck is a test-only dependency.
+seed derived from the workflow run ID. Portable lifecycle/exception regressions
+also run as bytecode and Melange JavaScript under Node. Native GC probes check
+that cancelled callbacks and collections release captured resources, and
+allocation ratios check bulk child and collection lifetime cancellation.
+QCheck is a test-only dependency.
 
 ```sh
 dune exec test/test_properties.exe -- --long --seed 24301 --no-colors

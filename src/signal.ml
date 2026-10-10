@@ -50,6 +50,20 @@ type 'value state = {
   scheduled : bool ref;
 }
 
+type scope_registry = {
+  live_cleanups : (int, unit) Hashtbl.t;
+  mutable cleanup_slots : int;
+  mutable owned_slots : int;
+  mutable cancelled_owned : int;
+}
+
+let make_scope_registry () = {
+  live_cleanups = Hashtbl.create 0;
+  cleanup_slots = 0;
+  owned_slots = 0;
+  cancelled_owned = 0;
+}
+
 type scope = {
   scope_id : int;
   scope_name : string;
@@ -58,6 +72,7 @@ type scope = {
   mount_callbacks : (unit -> unit) list ref;
   unmount_callbacks : (unit -> unit) list ref;
   owned_subscriptions : subscription list ref;
+  registry : scope_registry;
   mounted : bool ref;
   disposed_scope : bool ref;
 }
@@ -158,7 +173,7 @@ let max_stabilization_rounds = 10000
 
 exception Stabilization_limit_exceeded of int * int * int
 
-let stabilize owner =
+let stabilize_impl owner =
   let worked = ref false in
   let rounds = ref 0 in
   let effect_count = ref 0 in
@@ -208,6 +223,28 @@ let stabilize owner =
       stabilization_effects = !effect_count;
       stabilization_dirty_tasks = !dirty_count;
     }
+
+(* Only retains schedulers while their synchronous flush is running. A nested
+   flush of the same owner leaves queued work to the outer fixpoint loop. *)
+let stabilizing_owners = ref []
+
+(* Fun.protect's exceptional path restores raw backtraces, which Melange does
+   not implement. These finalizers only reset internal refs and cannot raise. *)
+let with_finally finally f =
+  match f () with
+  | result -> finally (); result
+  | exception exn -> finally (); raise exn
+
+let stabilize owner =
+  if not (List.exists (fun running -> running == owner) !stabilizing_owners) then
+    begin
+      stabilizing_owners := owner :: !stabilizing_owners;
+      with_finally
+        (fun () ->
+          stabilizing_owners :=
+            List.filter (fun running -> running != owner) !stabilizing_owners)
+        (fun () -> stabilize_impl owner)
+    end
 
 let constant owner initial =
   {
@@ -287,6 +324,17 @@ let dispose_signal reactive =
     reactive.subscribers.last <- None
   end
 
+let run_each f values =
+  let first_error = ref None in
+  List.iter
+    (fun value ->
+      try f value
+      with exn -> if !first_error = None then first_error := Some exn)
+    values;
+  match !first_error with None -> () | Some exn -> raise exn
+
+let run_callbacks callbacks = run_each (fun callback -> callback ()) callbacks
+
 let publish reactive next_value =
   if not !(reactive.disposed_signal) then begin
     reactive.current := next_value;
@@ -294,7 +342,7 @@ let publish reactive next_value =
       | None -> List.rev accumulated
       | Some subscriber -> snapshot (subscriber :: accumulated) subscriber.next
     in
-    List.iter
+    run_each
       (fun subscriber_value ->
         if not !(reactive.disposed_signal) then
           subscriber_value.callback next_value)
@@ -349,6 +397,8 @@ let map transform source =
 let map2 transform left right =
   if left.owner != right.owner then
     invalid_arg "map inputs must share one scheduler";
+  if !(left.disposed_signal) || !(right.disposed_signal) then
+    invalid_arg "cannot derive from a disposed signal";
   let derived =
     {
       (constant left.owner (transform (sample left) (sample right))) with
@@ -360,12 +410,11 @@ let map2 transform left right =
     schedule_computation derived scheduled (fun () ->
         publish derived (transform (sample left) (sample right)))
   in
-  derived.upstream_subscriptions :=
-    !(derived.upstream_subscriptions)
-    @ [
-        subscribe ~emit_initial:false left recompute;
-        subscribe ~emit_initial:false right recompute;
-      ];
+  let left_subscription = subscribe ~emit_initial:false left recompute in
+  (try
+    let right_subscription = subscribe ~emit_initial:false right recompute in
+    derived.upstream_subscriptions := [ left_subscription; right_subscription ]
+  with exn -> dispose_subscription left_subscription; raise exn);
   derived
 
 let cutoff equal source =
@@ -396,6 +445,7 @@ let make_scope name =
     mount_callbacks = ref [];
     unmount_callbacks = ref [];
     owned_subscriptions = ref [];
+    registry = make_scope_registry ();
     mounted = ref false;
     disposed_scope = ref false;
   }
@@ -409,36 +459,57 @@ let register_cleanup scope_value callback =
     incr scope_value.next_cleanup_id;
     let cleanup_id = !(scope_value.next_cleanup_id) in
     let disposed = ref false in
+    let action = ref (Some callback) in
+    let unregister = ref (fun () -> ()) in
+    let detach () =
+      let f = !unregister in
+      unregister := (fun () -> ());
+      f ()
+    in
     let entry = {
       cleanup_id;
       cleanup_callback = (fun () ->
-        if not !disposed then begin
-          disposed := true;
-          callback ()
-        end);
+        match !action with
+        | None -> ()
+        | Some callback ->
+            action := None;
+            disposed := true;
+            detach ();
+            callback ());
     } in
     let cancel () =
       if !disposed then ()
       else begin
         disposed := true;
-        scope_value.cleanup_callbacks :=
-          List.filter
-            (fun current -> current.cleanup_id <> cleanup_id)
-            !(scope_value.cleanup_callbacks)
+        action := None;
+        detach ()
       end
     in
+    let registry = scope_value.registry in
+    Hashtbl.add registry.live_cleanups cleanup_id ();
+    registry.cleanup_slots <- registry.cleanup_slots + 1;
     scope_value.cleanup_callbacks := entry :: !(scope_value.cleanup_callbacks);
+    unregister := (fun () ->
+      Hashtbl.remove registry.live_cleanups cleanup_id;
+      if not !(scope_value.disposed_scope) &&
+         Hashtbl.length registry.live_cleanups <= registry.cleanup_slots / 2 then
+        begin
+          scope_value.cleanup_callbacks :=
+            List.filter
+              (fun current -> Hashtbl.mem registry.live_cleanups current.cleanup_id)
+              !(scope_value.cleanup_callbacks);
+          registry.cleanup_slots <- Hashtbl.length registry.live_cleanups;
+          (* Remove retains the hash table's peak bucket array. Rebuild only
+             during proportional compaction, keeping metadata bounded too. *)
+          Hashtbl.reset registry.live_cleanups;
+          List.iter
+            (fun current -> Hashtbl.add registry.live_cleanups current.cleanup_id ())
+            !(scope_value.cleanup_callbacks)
+        end);
     { disposed; cancel }
   end
 
-let run_cleanups callbacks =
-  let first_error = ref None in
-  List.iter
-    (fun callback ->
-      try callback ()
-      with exn -> if !first_error = None then first_error := Some exn)
-    callbacks;
-  match !first_error with None -> () | Some exn -> raise exn
+let run_cleanups = run_callbacks
 
 let rec child_scope name parent =
   if !(parent.disposed_scope)
@@ -450,9 +521,11 @@ let rec child_scope name parent =
 
 and own scope_value subscription =
   if !(scope_value.disposed_scope) then dispose_subscription subscription
-  else
+  else begin
     scope_value.owned_subscriptions :=
       subscription :: !(scope_value.owned_subscriptions);
+    scope_value.registry.owned_slots <- scope_value.registry.owned_slots + 1
+  end;
   subscription
 
 and dispose_scope scope_value =
@@ -470,6 +543,10 @@ and dispose_scope scope_value =
     scope_value.owned_subscriptions := [];
     scope_value.mount_callbacks := [];
     scope_value.unmount_callbacks := [];
+    Hashtbl.reset scope_value.registry.live_cleanups;
+    scope_value.registry.cleanup_slots <- 0;
+    scope_value.registry.owned_slots <- 0;
+    scope_value.registry.cancelled_owned <- 0;
     run_cleanups
       [
         (fun () ->
@@ -485,6 +562,14 @@ and dispose_scope scope_value =
   end
 
 let scope name = make_scope name
+
+let scope_cleanup_count scope_value =
+  Hashtbl.length scope_value.registry.live_cleanups
+
+let scope_owned_count scope_value =
+  List.fold_left
+    (fun count subscription -> if !(subscription.disposed) then count else count + 1)
+    0 !(scope_value.owned_subscriptions)
 
 let on_mount scope_value callback =
   if !(scope_value.disposed_scope) then ()
@@ -509,7 +594,9 @@ let mount scope_value =
     scope_value.mounted := true;
     let callbacks = List.rev !(scope_value.mount_callbacks) in
     scope_value.mount_callbacks := [];
-    List.iter (fun callback -> callback ()) callbacks
+    List.iter
+      (fun callback -> if not !(scope_value.disposed_scope) then callback ())
+      callbacks
   end
 
 let active scope_value =
@@ -536,39 +623,101 @@ let dispose_switch switch_value =
   then ()
   else begin
     switch_value.switch_disposed := true;
-    dispose_subscription switch_value.switch_subscription;
-    dispose_scope !(switch_value.switch_scope)
+    run_cleanups
+      [ (fun () -> dispose_subscription switch_value.switch_subscription);
+        (fun () -> dispose_scope !(switch_value.switch_scope)) ]
   end
+
+(* Collection handles unregister themselves on manual disposal. Clearing the
+   action also prevents an externally retained disposed handle retaining its
+   owner and former resources. *)
+let own_lifetime parent cleanup =
+  let action = ref (fun () -> ()) in
+  let disposed = ref false in
+  let handle = { disposed; cancel = (fun () -> !action ()) } in
+  action := (fun () ->
+    action := (fun () -> ());
+    disposed := true;
+    let registry = parent.registry in
+    if not !(parent.disposed_scope) then begin
+      registry.cancelled_owned <- registry.cancelled_owned + 1;
+      if registry.cancelled_owned >= registry.owned_slots - registry.owned_slots / 2 then begin
+        parent.owned_subscriptions :=
+          List.filter (fun current -> not !(current.disposed)) !(parent.owned_subscriptions);
+        registry.owned_slots <- List.length !(parent.owned_subscriptions);
+        registry.cancelled_owned <- 0
+      end
+    end;
+    cleanup ());
+  ignore (own parent handle);
+  fun () -> handle.cancel ()
 
 let switch parent source equal mount_scope =
   if !(parent.disposed_scope) then
     invalid_arg "cannot switch in a disposed scope";
+  if !(source.disposed_signal) then
+    invalid_arg "cannot switch from a disposed signal";
   let initial_key = sample source in
   let current_key = ref initial_key in
-  let current_scope = ref (mount_scope initial_key) in
+  (* Install ownership and observation before calling user factories. The
+     provisional scope gives disposal a valid target during construction. *)
+  let current_scope = ref (scope "switch:initializing") in
   let disposed = ref false in
-  mount !current_scope;
-  let subscription =
-    subscribe ~emit_initial:false source (fun next_key ->
-        if !disposed || equal !current_key next_key then ()
+  let cancelled = ref (fun () -> ()) in
+  let pending = ref None in
+  let busy = ref true in
+  let replace next_key =
+    if !disposed ||
+       (not !(!current_scope.disposed_scope) && equal !current_key next_key) then ()
+    else begin
+      dispose_scope !current_scope;
+      if not !disposed then begin
+        let next_scope = mount_scope next_key in
+        if !disposed then dispose_scope next_scope
         else begin
-          dispose_scope !current_scope;
-          let next_scope = mount_scope next_key in
           current_key := next_key;
           current_scope := next_scope;
-          mount next_scope
-        end)
+          (try mount next_scope with exn ->
+            (try dispose_scope next_scope with _ -> ());
+            raise exn)
+        end
+      end
+    end
   in
-  let switch_value =
-    {
-      switch_subscription = subscription;
-      switch_scope = current_scope;
-      switch_disposed = disposed;
-    }
+  let drain () =
+    busy := true;
+    with_finally (fun () -> busy := false) (fun () ->
+      while !pending <> None && not !disposed do
+        match !pending with
+        | None -> ()
+        | Some next_key -> pending := None; replace next_key
+      done)
   in
-  ignore
-    (own parent { disposed; cancel = (fun () -> dispose_switch switch_value) });
-  switch_value
+  let observer = subscribe ~emit_initial:false source (fun next_key ->
+    if not !disposed then begin
+      pending := Some next_key;
+      if not !busy then drain ()
+    end) in
+  let subscription = { observer with cancel = (fun () ->
+    pending := None;
+    run_cleanups [observer.cancel; !cancelled]) } in
+  let switch_value = {
+    switch_subscription = subscription;
+    switch_scope = current_scope;
+    switch_disposed = disposed;
+  } in
+  try
+    cancelled := own_lifetime parent (fun () -> dispose_switch switch_value);
+    let initial_scope = mount_scope initial_key in
+    dispose_scope !current_scope;
+    current_scope := initial_scope;
+    if !disposed then dispose_scope initial_scope else mount initial_scope;
+    drain ();
+    switch_value
+  with exn ->
+    let original = exn in
+    (try run_cleanups [!cancelled; (fun () -> dispose_scope !current_scope)] with _ -> ());
+    raise original
 
 let rec find_entry_index entries key compare index =
   match entries with
@@ -657,15 +806,28 @@ let remove_remaining counts index =
   in
   loop (index + 1)
 
-let reconcile_keyed (type key) scheduler
+let reconcile_keyed_unguarded (type key) stopped scheduler
     (entries_ref : (key, 'item) keyed_entry list ref) (items : 'item list)
     (key_fn : 'item -> key) (compare : key -> key -> int) mount_scope on_patch =
   let module Key_map = Map.Make (struct
     type t = key
-
     let compare = compare
   end) in
   let new_index = key_index items key_fn compare in
+  let first_error = ref None in
+  let attempt f =
+    try Some (f ())
+    with exn ->
+      if !first_error = None then first_error := Some exn;
+      None
+  in
+  let release entry =
+    ignore (attempt (fun () -> dispose_scope entry.entry_scope));
+    dispose_signal (value entry.entry_state)
+  in
+  let patch value =
+    if not (stopped ()) then ignore (attempt (fun () -> on_patch value))
+  in
   let _, retained, removed =
     List.fold_left
       (fun (index, retained, removed) entry ->
@@ -674,11 +836,6 @@ let reconcile_keyed (type key) scheduler
         | None -> (index + 1, retained, (index, entry) :: removed))
       (0, [], []) !entries_ref
   in
-  List.iter
-    (fun (index, entry) ->
-      on_patch (Remove (entry.entry_key, index));
-      dispose_scope entry.entry_scope)
-    removed;
   let retained = List.rev retained in
   let size, existing =
     List.fold_left
@@ -686,12 +843,11 @@ let reconcile_keyed (type key) scheduler
         (index + 1, Key_map.add entry.entry_key (index, entry) entries))
       (0, Key_map.empty) retained
   in
-  (* Unprocessed retained entries stay in their original order. A Fenwick tree
-     counts those before each key, giving the current Move index in O(log n)
-     without searching or repeatedly rebuilding the visible list. *)
   let counts = remaining_counts size in
+  let created = ref [] in
   let rec loop index result = function
     | [] -> List.rev result
+    | _ when stopped () -> List.rev result
     | current :: rest ->
         let key = key_fn current in
         let entry =
@@ -699,64 +855,121 @@ let reconcile_keyed (type key) scheduler
           | Some (original_index, entry) ->
               set_keyed_item entry.entry_state current;
               let before = remaining_before counts original_index in
-              if before <> 0 then on_patch (Move (key, index + before, index));
+              if before <> 0 then patch (Move (key, index + before, index));
               remove_remaining counts original_index;
-              entry
+              Some entry
           | None ->
               let item_state = state scheduler current in
-              let child = mount_scope (value item_state) in
-              ignore (own_signal child (value item_state));
-              let entry =
-                {
-                  entry_key = key;
-                  entry_state = item_state;
-                  entry_scope = child;
-                }
-              in
-              mount child;
-              on_patch (Insert (key, index));
-              entry
+              match attempt (fun () -> mount_scope (value item_state)) with
+              | None -> dispose_signal (value item_state); None
+              | Some child ->
+                  let entry = { entry_key = key; entry_state = item_state; entry_scope = child } in
+                  created := entry :: !created;
+                  ignore (own_signal child (value item_state));
+                  if stopped () then (release entry; None)
+                  else match attempt (fun () -> mount child) with
+                    | None -> release entry; None
+                    | Some () ->
+                        if stopped () then (release entry; None)
+                        else (patch (Insert (key, index)); Some entry)
         in
-        loop (index + 1) (entry :: result) rest
+        match entry with
+        | None -> loop index result rest
+        | Some entry -> loop (index + 1) (entry :: result) rest
   in
-  entries_ref := loop 0 [] items
+  (* User callback errors do not abandon already mounted scopes or leave removed
+     entries in the reusable index. Finish the internal edit, then report the
+     first error. External patch consumers must resync after callback failure. *)
+  let finish () =
+    List.iter
+      (fun (index, entry) ->
+        patch (Remove (entry.entry_key, index));
+        release entry)
+      removed;
+    let result = loop 0 [] items in
+    if stopped () then begin
+      List.iter release !created;
+      entries_ref := []
+    end else entries_ref := result
+  in
+  (try finish () with exn ->
+    let original = match !first_error with None -> exn | Some first -> first in
+    List.iter release !created;
+    entries_ref := List.filter (fun entry -> not !(entry.entry_scope.disposed_scope)) retained;
+    raise original);
+  match !first_error with None -> () | Some exn -> raise exn
+
+(* Obj.repr is used only for physical identity across the existential key/item
+   types of simultaneous calls; no values are inspected or cast back. *)
+let reconciling_entries = ref []
+
+let reconcile_keyed_impl stopped scheduler entries_ref items key_fn compare
+    mount_scope on_patch =
+  let identity = Obj.repr entries_ref in
+  if List.exists (fun running -> running == identity) !reconciling_entries then
+    invalid_arg "cannot recursively reconcile the same entries";
+  reconciling_entries := identity :: !reconciling_entries;
+  with_finally
+    (fun () ->
+      reconciling_entries :=
+        List.filter (fun running -> running != identity) !reconciling_entries)
+    (fun () -> reconcile_keyed_unguarded stopped scheduler entries_ref items
+      key_fn compare mount_scope on_patch)
+
+let reconcile_keyed scheduler entries_ref items key_fn compare mount_scope on_patch =
+  reconcile_keyed_impl (fun () -> false) scheduler entries_ref items key_fn compare
+    mount_scope on_patch
 
 let dispose_keyed keyed_value =
   if !(keyed_value.keyed_disposed) then ()
   else begin
     keyed_value.keyed_disposed := true;
-    dispose_subscription keyed_value.keyed_subscription;
+    let entries = !(keyed_value.keyed_entries) in
+    keyed_value.keyed_entries := [];
     run_cleanups
-      (List.map
-         (fun entry -> fun () -> dispose_scope entry.entry_scope)
-         !(keyed_value.keyed_entries))
+      ((fun () -> dispose_subscription keyed_value.keyed_subscription)
+       :: List.map (fun entry -> fun () -> dispose_scope entry.entry_scope) entries)
   end
 
 let keyed parent source key_fn compare mount_scope on_patch =
   if !(parent.disposed_scope) then
     invalid_arg "cannot create a keyed collection in a disposed scope";
+  if !(source.disposed_signal) then
+    invalid_arg "cannot reconcile a disposed signal";
   let scheduler = source.owner in
-  let initial_items = sample source in
-  let entries_ref = ref [] in
-  reconcile_keyed scheduler entries_ref initial_items key_fn compare mount_scope
-    on_patch;
-  let disposed = ref false in
-  let subscription =
-    subscribe ~emit_initial:false source (fun items ->
-        reconcile_keyed scheduler entries_ref items key_fn compare mount_scope
-          on_patch)
+  let entries_ref = ref [] and disposed = ref false in
+  let reconciling = ref false and pending = ref None in
+  let reconcile items =
+    pending := Some items;
+    if not !reconciling then begin
+      reconciling := true;
+      with_finally (fun () -> reconciling := false) (fun () ->
+        let first_error = ref None in
+        while !pending <> None && not !disposed do
+          let items = Option.get !pending in
+          pending := None;
+          (try reconcile_keyed_impl (fun () -> !disposed) scheduler entries_ref
+              items key_fn compare mount_scope on_patch
+           with exn -> if !first_error = None then first_error := Some exn)
+        done;
+        pending := None;
+        match !first_error with None -> () | Some exn -> raise exn)
+    end
   in
-  let keyed_value =
-    {
-      keyed_subscription = subscription;
-      keyed_entries = entries_ref;
-      keyed_compare = compare;
-      keyed_disposed = disposed;
-    }
-  in
-  ignore
-    (own parent { disposed; cancel = (fun () -> dispose_keyed keyed_value) });
-  keyed_value
+  let subscription = subscribe ~emit_initial:false source reconcile in
+  let cancelled = ref (fun () -> ()) in
+  let wrapped = { subscription with cancel = (fun () ->
+    pending := None;
+    run_cleanups [subscription.cancel; !cancelled]) } in
+  let keyed_value = { keyed_subscription = wrapped; keyed_entries = entries_ref;
+                      keyed_compare = compare; keyed_disposed = disposed } in
+  cancelled := own_lifetime parent (fun () -> dispose_keyed keyed_value);
+  try
+    if not !disposed then reconcile (sample source);
+    keyed_value
+  with exn ->
+    (try dispose_keyed keyed_value with _ -> ());
+    raise exn
 
 let keyed_find_scope keyed_value key =
   let rec loop entries =

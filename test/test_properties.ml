@@ -752,7 +752,8 @@ let scope_allocations =
             dispose_scope parent)
       in
       int_equal "all scopes unmount" size !unmounts;
-      allocation_budget "scopes" size 192 words)
+      (* Per-scope registry accounting adds bounded storage, independent of n. *)
+      allocation_budget "scopes" size 256 words)
 
 let logarithmic_depth size =
   let rec loop n depth =
@@ -786,6 +787,51 @@ let keyed_comparisons =
           !comparisons budget;
       dispose_scope parent)
 
+let publication_failures =
+  property "publication failures notify all live dependents and recover"
+    ~print:(Q.Print.pair Q.Print.int Q.Print.int)
+    (G.pair (G.int_range 1 40) (G.int_range 0 100))
+    (fun (size, position) ->
+      let owner = scheduler () in
+      let input = state owner 0 in
+      let seen = Array.make size 0 in
+      let failed = position mod size in
+      let handles = Array.init size (fun i ->
+        subscribe ~emit_initial:false (value input) (fun v ->
+          seen.(i) <- v;
+          if i = failed then failwith "publication")) in
+      let derived = map (( * ) 2) (value input) in
+      set input 1;
+      (match stabilize owner with
+      | () -> Q.Test.fail_report "publication failure did not propagate"
+      | exception Failure _ -> ());
+      dispose_subscription handles.(failed);
+      stabilize owner;
+      require (Array.for_all ((=) 1) seen) "a live callback missed publication";
+      int_equal "downstream survived observer exception" 2 (get derived);
+      set input 2;
+      stabilize owner;
+      int_equal "later downstream update" 4 (get derived))
+
+let registry_cancellation =
+  property "arbitrary cleanup cancellations preserve live counts and bounded storage"
+    ~print:(Q.Print.list Q.Print.int)
+    (bounded_list 100 (G.int_range 0 63)) (fun cancellations ->
+      let sc = scope "registry" in
+      let calls = Array.make 64 0 and cancelled = Array.make 64 false in
+      let handles = Array.init 64 (fun i ->
+        register_cleanup sc (fun () -> calls.(i) <- calls.(i) + 1)) in
+      List.iter (fun i ->
+        cancelled.(i) <- true;
+        dispose_subscription handles.(i);
+        let live = Array.fold_left (fun count dead -> if dead then count else count+1) 0 cancelled in
+        int_equal "live registrations" live (scope_cleanup_count sc);
+        require (List.length !(sc.cleanup_callbacks) <= 2 * live) "unbounded tombstones") cancellations;
+      dispose_scope sc;
+      Array.iteri (fun i count ->
+        int_equal "uncancelled cleanup runs exactly once" (if cancelled.(i) then 0 else 1) count) calls;
+      int_equal "disposed registry is empty" 0 (scope_cleanup_count sc))
+
 let () =
   QCheck_base_runner.run_tests_main
     [
@@ -806,4 +852,6 @@ let () =
       subscription_allocations;
       scope_allocations;
       keyed_comparisons;
+      publication_failures;
+      registry_cancellation;
     ]
