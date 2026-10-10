@@ -137,6 +137,23 @@ val get : 'value signal -> 'value
 (** [get_state st] is {!get} of [value st]. *)
 val get_state : 'value state -> 'value
 
+(** [signal_owner sig] is the scheduler that owns [sig]; states and derived
+    nodes must be created on that same scheduler. *)
+val signal_owner : 'value signal -> scheduler
+
+(** [state_pending st] is the value staged by {!set}/{!update} but not yet
+    published, or [None] when no write is staged. Readers re-entered inside a
+    flush must see the staged value; {!get_state} keeps returning the
+    published one. *)
+val state_pending : 'value state -> 'value option
+
+(** [has_upstream_subscriptions sig] is [true] while [sig] currently holds
+    live upstream subscriptions: a derived node with live subscribers, which
+    propagates on publish. [false] for sources and for dormant derived nodes
+    that released upstream work when their last subscriber left; such a node
+    no longer needs owning to avoid leaking work. *)
+val has_upstream_subscriptions : 'value signal -> bool
+
 (** [set st v] stages [v] as the next value; published on {!stabilize}. *)
 val set : 'value state -> 'value -> unit
 

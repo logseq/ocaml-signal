@@ -471,6 +471,13 @@ let value state_value = state_value.state_signal
 
 let get_state state_value = sample (value state_value)
 
+let signal_owner reactive = reactive.owner
+
+let state_pending state_value = !(state_value.pending)
+
+let has_upstream_subscriptions reactive =
+  !(reactive.upstream_subscriptions) <> []
+
 let set state_value next_value =
   state_value.pending := Some next_value;
   schedule_once (value state_value).owner state_value.scheduled (fun () ->
