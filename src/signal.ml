@@ -168,6 +168,17 @@ let schedule_once owner scheduled task =
 let dispose_subscription (sub : subscription) = sub.cancel ()
 let subscription_disposed (sub : subscription) = !(sub.disposed)
 
+let make_subscription cancel =
+  let disposed = ref false in
+  let sub = { disposed; cancel = (fun () -> ()) } in
+  sub.cancel <-
+    (fun () ->
+      if not !(sub.disposed) then begin
+        sub.disposed := true;
+        cancel ()
+      end);
+  sub
+
 let raise_with bt exn =
   (* Melange compiles [raise_with_backtrace] to [caml_restore_raw_backtrace],
      which throws because the primitive is not polyfilled. Native and bytecode

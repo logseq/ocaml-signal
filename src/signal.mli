@@ -185,6 +185,11 @@ val observe : 'value signal -> ('value -> unit) -> subscription
     Cancelling a subscription returned by {!own} also drops it from the scope. *)
 val dispose_subscription : subscription -> unit
 
+(** [make_subscription cancel] is a handle that runs [cancel] once, on
+    {!dispose_subscription}. Hosts use it for cancellable work that is not a
+    signal subscription. *)
+val make_subscription : (unit -> unit) -> subscription
+
 (** [subscription_disposed sub] is [true] after [sub] has been cancelled,
     including when its signal is disposed. *)
 val subscription_disposed : subscription -> bool
