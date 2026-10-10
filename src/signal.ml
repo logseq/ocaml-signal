@@ -134,6 +134,9 @@ type ('k, 'a) keyed = {
 type task =
   | Expand of scope
   | Call of (unit -> unit)
+  (* Fence for a re-entrant [dispose_scope]. Work pushed above it belongs to
+     that call and runs before it returns. *)
+  | Marker of bool ref
 
 let scheduler () =
   {
@@ -829,8 +832,12 @@ let register_cleanup (scope_value : scope) callback =
   end
 
 (* Iterative disposal. [disposing] is only set while the outermost call is
-   draining the heap stack; it does not retain scopes afterwards. The runtime
-   graph is single-domain aside from {!fresh_scope_id}. *)
+   draining the heap stack; it does not retain scopes afterwards. A nested
+   [dispose_scope] drains until its [Marker] before returning, so a caller
+   such as [Fun.protect] observes a finished scope. [child_scope] does not
+   call [dispose_scope]: it only pushes [Expand], so a deep chain stays on
+   this heap stack. The runtime graph is single-domain aside from
+   {!fresh_scope_id}. *)
 let dispose_stack = ref []
 let disposing = ref false
 let dispose_error = ref None
@@ -918,23 +925,57 @@ let expand_scope (scope_value : scope) =
   push_fifo (List.map (fun sub () -> dispose_subscription sub) owned);
   push_fifo cleanups
 
+let mark_disposed (scope_value : scope) =
+  scope_value.disposed <- true;
+  scope_value.mounted <- false
+
+let enqueue_expand (scope_value : scope) =
+  dispose_stack := Expand scope_value :: !dispose_stack
+
+let run_task error = function
+  | Expand scope_value -> expand_scope scope_value
+  | Call f -> (try f () with exn -> note_exn error exn)
+  | Marker _ -> ()
+
+(* Run until [marker] is popped. Tasks below it belong to the caller. *)
+let drain_until marker error =
+  let stop = ref false in
+  while (not !stop) && !dispose_stack <> [] do
+    let task = List.hd !dispose_stack in
+    dispose_stack := List.tl !dispose_stack;
+    match task with
+    | Marker reached when reached == marker -> stop := true
+    | other -> (
+        try run_task error other
+        with exn ->
+          note_exn error exn;
+          (* Drop the rest of this call's work, but leave the caller's. *)
+          let pending = ref true in
+          while !pending && !dispose_stack <> [] do
+            match List.hd !dispose_stack with
+            | Marker reached when reached == marker ->
+                dispose_stack := List.tl !dispose_stack;
+                pending := false
+            | _ -> dispose_stack := List.tl !dispose_stack
+          done;
+          stop := true)
+  done
+
 let dispose_scope (scope_value : scope) =
   if not scope_value.disposed then begin
-    scope_value.disposed <- true;
-    scope_value.mounted <- false;
-    dispose_stack := Expand scope_value :: !dispose_stack;
+    mark_disposed scope_value;
     if not !disposing then begin
       disposing := true;
       dispose_error := None;
+      enqueue_expand scope_value;
       (try
          while !dispose_stack <> [] do
            let task = List.hd !dispose_stack in
            dispose_stack := List.tl !dispose_stack;
-           match task with
-           | Expand scope_value -> expand_scope scope_value
-           | Call f -> (
-               try f ()
-               with exn -> note_exn dispose_error exn)
+           try run_task dispose_error task
+           with exn ->
+             note_exn dispose_error exn;
+             dispose_stack := []
          done
        with exn -> note_exn dispose_error exn);
       disposing := false;
@@ -943,13 +984,32 @@ let dispose_scope (scope_value : scope) =
       dispose_error := None;
       raise_if error
     end
+    else begin
+      (* Finish this scope before returning. The caller's tasks sit under
+         the marker and are not consumed here. *)
+      let marker = ref false in
+      let local_error = ref None in
+      dispose_stack := Marker marker :: !dispose_stack;
+      enqueue_expand scope_value;
+      (try drain_until marker local_error
+       with exn -> note_exn local_error exn);
+      raise_if !local_error
+    end
   end
 
 let child_scope name (parent : scope) =
   if parent.disposed then invalid_arg "cannot create a child of a disposed scope";
   let child = make_scope name in
   let _owned =
-    let cleanup = register_cleanup parent (fun () -> dispose_scope child) in
+    (* Push the child onto the active dispose stack instead of calling
+       [dispose_scope]. A chain of children then stays iterative. *)
+    let cleanup =
+      register_cleanup parent (fun () ->
+          if not child.disposed then begin
+            mark_disposed child;
+            enqueue_expand child
+          end)
+    in
     (* Inline [own] would recurse; attach the handle directly. *)
     let node =
       { sub = cleanup; alive = true; prev = child.owned_last; next = None }

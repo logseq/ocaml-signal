@@ -288,9 +288,13 @@ val own_signal : scope -> 'value signal -> 'value signal
 val mount : scope -> unit
 
 (** [dispose_scope sc] marks [sc] disposed and runs cleanups, owned
-    subscriptions, and unmount callbacks. Idempotent. If a callback raises,
-    the remaining callbacks still run, then the first exception is re-raised
-    with its backtrace. *)
+    subscriptions, and unmount callbacks to completion before returning.
+    That includes a call made from a cleanup of a scope that is already
+    being disposed, so a [Fun.protect] around it observes the finished
+    scope. A {!child_scope} chain is still torn down on the heap stack and
+    does not grow the native or JavaScript call stack. Idempotent. If a
+    callback raises, the remaining callbacks of that disposal still run,
+    then the first exception is re-raised with its backtrace. *)
 val dispose_scope : scope -> unit
 
 (** [active sc] is [true] while [sc] is mounted and not disposed. *)

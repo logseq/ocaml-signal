@@ -242,6 +242,40 @@ let test_scope_disposal_boundaries () =
   check_bool "disposed scope rejects new children" true child_rejected;
   check_bool "disposed scope rejects new state" true state_rejected
 
+let test_nested_dispose_completes_before_return () =
+  let parent = scope "parent" in
+  let child = scope "child" in
+  let trace = ref [] in
+  let segment_size = ref 1 in
+  on_unmount child (fun () ->
+      segment_size := 0;
+      trace := !trace @ [ "child-unmount" ]);
+  on_dispose parent (fun () ->
+      Fun.protect
+        (fun () -> dispose_scope child)
+        ~finally:(fun () ->
+          if !segment_size <> 0 then
+            failwith "unregister of a non-empty segment";
+          trace := !trace @ [ "unregister" ]));
+  on_unmount parent (fun () -> trace := !trace @ [ "parent-unmount" ]);
+  dispose_scope parent;
+  check "nested dispose finishes before the caller continues"
+    [ "child-unmount"; "unregister"; "parent-unmount" ]
+    !trace;
+  let failed = scope "failed-child" in
+  let owner = scope "owner" in
+  let owner_unmounted = ref false in
+  on_unmount failed (fun () -> failwith "child failed");
+  on_dispose owner (fun () -> dispose_scope failed);
+  on_unmount owner (fun () -> owner_unmounted := true);
+  let raised =
+    match dispose_scope owner with
+    | () -> false
+    | exception Failure msg -> msg = "child failed"
+  in
+  check_bool "nested failure is re-raised" true raised;
+  check_bool "parent unmount still ran" true !owner_unmounted
+
 let test_switch_lifecycle () =
   let scheduler = scheduler () in
   let parent = scope "screen" in
@@ -821,5 +855,7 @@ let () =
             test_keyed_function_payloads;
           Alcotest.test_case "deep acyclic chain does not hit the round cap"
             `Quick test_deep_acyclic_chain_does_not_hit_round_cap;
+          Alcotest.test_case "nested dispose completes before return" `Quick
+            test_nested_dispose_completes_before_return;
         ] );
     ]
