@@ -34,12 +34,15 @@ let nested_stabilize () =
     let owner = scheduler () and calls = ref [] in
     enqueue owner (fun () -> calls := 1 :: !calls; stabilize owner);
     enqueue owner (fun () -> calls := 2 :: !calls);
+    (* The nested stabilize drains the snapshot synchronously: the second
+       queued task runs inside the inner call instead of throwing or waiting
+       for the outer run. Each call that ran work bumps the generation. *)
     stabilize owner;
-    require (List.rev !calls = [1;2] && generation owner = 1) "nested stabilize is not deferred to outer run";
+    require (List.rev !calls = [1;2] && generation owner = 2) "nested stabilize did not drain queued work synchronously";
     enqueue owner (fun () -> stabilize owner; failwith "expected");
     enqueue owner (fun () -> calls := 3 :: !calls);
     failure (fun () -> stabilize owner); stabilize owner;
-    require (List.rev !calls = [1;2;3]) "running guard not reset after exception") [enqueue_effect;enqueue_dirty];
+    require (List.rev !calls = [1;2;3]) "nested stabilize lost queued work after exception") [enqueue_effect;enqueue_dirty];
   let outer = scheduler () and inner = scheduler () and calls = ref 0 in
   enqueue_effect outer (fun () -> enqueue_effect inner (fun () -> incr calls); stabilize inner);
   stabilize outer; require (!calls = 1) "different scheduler nested flush blocked";
@@ -96,7 +99,7 @@ let keyed_failures () =
           | _ -> ()) in
     armed := true; set input [3;4]; failure (fun () -> stabilize owner);
     armed := false; stabilize owner;
-    require (List.for_all (fun e -> active e.entry_scope) !(k.keyed_entries)) "failed reconcile retained disposed entry";
+    require (List.for_all (fun e -> active (keyed_entry_scope e)) (keyed_entries k)) "failed reconcile retained disposed entry";
     set input [2]; stabilize owner;
     require (active (keyed_find_scope k 2)) "valid later edit reused disposed scope";
     dispose_scope parent;
@@ -132,9 +135,9 @@ let ownership_churn () =
   for _ = 1 to 256 do
     let sw = switch parent input (=) (fun _ -> scope "branch") in dispose_switch sw;
     let k = keyed parent input Fun.id Int.compare (fun _ -> scope "item") ignore in dispose_keyed k;
-    require (!(k.keyed_entries) = []) "disposed collection retains item payloads"
+    require (keyed_entries k = []) "disposed collection retains item payloads"
   done;
-  require (List.length !(parent.owned_subscriptions) <= 1) "owner retains history of disposed collection handles";
+  require (List.length (scope_owned_entries parent) <= 1) "owner retains history of disposed collection handles";
   dispose_scope parent
 
 let switch_mount_retry () =
@@ -145,7 +148,7 @@ let switch_mount_retry () =
       on_unmount sc (fun () -> if key=1 && !armed then failwith "cleanup"); sc) in
   set input 1; failure (fun () -> stabilize owner);
   armed := false; set input 1; stabilize owner;
-  require (active !(sw.switch_scope)) "same key failed to retry a failed mount";
+  require (active (switch_scope sw)) "same key failed to retry a failed mount";
   dispose_scope parent
 
 let comparator_failure_after_remove () =
@@ -165,7 +168,7 @@ let public_reconcile_reentry () =
   let mount _ = let sc = scope "item" in made := sc :: !made; sc in
   invalid (fun () -> reconcile_keyed owner entries [1] Fun.id Int.compare mount
       (fun _ -> reconcile_keyed owner entries [2] Fun.id Int.compare mount ignore));
-  List.iter (fun entry -> dispose_scope entry.entry_scope) !entries;
+  List.iter (fun entry -> dispose_scope (keyed_entry_scope entry)) !entries;
   require (List.for_all (fun sc -> not (active sc)) !made) "public reconcile reentry lost inner scope"
 
 let switch_construction_reentry () =
@@ -177,15 +180,15 @@ let switch_construction_reentry () =
         let advance () = if key < 2 then (set input (key+1); stabilize owner) in
         if phase=0 then advance () else on_mount sc advance;
         sc) in
-    require ((!(sw.switch_scope)).scope_name = "2") "switch missed publication during construction";
-    require (active !(sw.switch_scope)) "switch construction returned inactive branch";
+    require (scope_name (switch_scope sw) = "2") "switch missed publication during construction";
+    require (active (switch_scope sw)) "switch construction returned inactive branch";
     dispose_scope parent;
-    require (List.for_all (fun sc -> !(sc.disposed_scope)) !made) "construction reentry orphaned branch") [0;1];
+    require (List.for_all scope_is_disposed !made) "construction reentry orphaned branch") [0;1];
   let parent = scope "parent" and owner = scheduler () and made = ref None in
   let sw = switch parent (constant owner 0) (=) (fun _ ->
       dispose_scope parent; let sc = scope "late" in made := Some sc; sc) in
-  require (!(sw.switch_disposed)) "factory disposal did not cancel switch";
-  require (match !made with Some sc -> !(sc.disposed_scope) | None -> false) "factory returned scope after parent disposal leaked"
+  require (switch_is_disposed sw) "factory disposal did not cancel switch";
+  require (match !made with Some sc -> scope_is_disposed sc | None -> false) "factory returned scope after parent disposal leaked"
 
 let keyed_first_error () =
   let owner = scheduler () and parent = scope "parent" and armed = ref false in
@@ -204,7 +207,7 @@ let switch_subscription_state () =
   let source = constant owner 0 in
   let sw = switch parent source (=) (fun _ -> scope "branch") in
   dispose_signal source;
-  require (!(sw.switch_subscription.disposed)) "switch subscription lost source cancellation state";
+  require (subscription_disposed (switch_subscription sw)) "switch subscription lost source cancellation state";
   dispose_scope parent
 
 let registry_bounds () =
@@ -214,7 +217,7 @@ let registry_bounds () =
     let index = (i * 17) mod 64 in
     dispose_subscription handles.(index);
     require (scope_cleanup_count sc = 63-i) "cleanup live count drifted";
-    require (List.length !(sc.cleanup_callbacks) <= 2 * (63-i)) "cleanup tombstones exceed bound"
+    require (List.length (scope_cleanup_entries sc) <= 2 * (63-i)) "cleanup tombstones exceed bound"
   done;
   dispose_scope sc;
   require (!calls = []) "cancelled callback ran after compaction";
@@ -224,14 +227,88 @@ let registry_bounds () =
   for i=0 to 63 do
     dispose_switch switches.((i * 17) mod 64);
     require (scope_owned_count parent = 63-i) "owner live count drifted";
-    require (List.length !(parent.owned_subscriptions) <= 2 * (63-i)) "owner tombstones exceed bound"
+    require (List.length (scope_owned_entries parent) <= 2 * (63-i)) "owner tombstones exceed bound"
   done;
   dispose_scope parent;
   let parent = scope "direct-cancel" in
   let sw = switch parent source (=) (fun _ -> scope "branch") in
-  dispose_subscription (List.hd !(parent.owned_subscriptions));
-  require (!(sw.switch_disposed) && not (active !(sw.switch_scope))) "owner handle cancellation leaked branch";
+  dispose_subscription (List.hd (scope_owned_entries parent));
+  require (switch_is_disposed sw && not (active (switch_scope sw))) "owner handle cancellation leaked branch";
   dispose_scope parent
+
+(* Review probes: two-phase stabilization keeps observers consistent. *)
+let observer_consistent_graph () =
+  let owner = scheduler () in
+  let input = state owner 0 in
+  let mid = map succ (value input) in
+  let deep = map succ mid in
+  let seen = ref [] in
+  ignore (subscribe ~emit_initial:false mid (fun _ -> seen := get deep :: !seen));
+  set input 1; stabilize owner;
+  require (!seen = [3]) "observer read a mid-propagation value";
+  (* A set staged by an observer lands in a later round of the same stabilize. *)
+  let other = state owner 0 in
+  let other_derived = map succ (value other) in
+  ignore (subscribe ~emit_initial:false mid (fun _ -> set other 41));
+  set input 3; stabilize owner;
+  require (get other_derived = 42) "observer write did not stage a later round"
+
+(* Review probes: a failed transform is rescheduled, not left stale. *)
+let transform_reschedule () =
+  let owner = scheduler () in
+  let input = state owner 0 in
+  let armed = ref true in
+  let derived = map (fun v -> if !armed && v = 1 then failwith "expected"; v * 10) (value input) in
+  set input 1;
+  failure (fun () -> stabilize owner);
+  armed := false;
+  stabilize owner;
+  require (get derived = 10) "failed transform did not recompute";
+  set input 2; stabilize owner;
+  require (get derived = 20) "transform stayed stale after recovery"
+
+(* Review probes: a chain deeper than the round cap still completes —
+   the cap measures real divergence, not rank depth. *)
+let deep_chain_completes () =
+  let owner = scheduler () in
+  let input = state owner 0 in
+  let last =
+    List.fold_left (fun signal _ -> map succ signal) (value input)
+      (List.init (max_stabilization_rounds + 1) Fun.id)
+  in
+  set input 1; stabilize owner;
+  require (get last = max_stabilization_rounds + 2)
+    "deep acyclic chain exceeded the round cap"
+
+(* Review probes: own+cancel keeps the owned list bounded by the live set. *)
+let own_cancel_bound () =
+  let parent = scope "churn" and owner = scheduler () in
+  let input = constant owner 0 in
+  for _ = 1 to 10_000 do
+    dispose_subscription (own parent (subscribe ~emit_initial:false input ignore))
+  done;
+  require (List.length (scope_owned_entries parent) < 1000)
+    "owned handle list grows without bound";
+  require (scope_owned_count parent = 0) "live owned count drifted";
+  dispose_scope parent
+
+(* Review probes: a derived whose subscribers went away stops recomputing and
+   reconnects on demand. *)
+let necessity_release () =
+  let owner = scheduler () in
+  let input = state owner 0 in
+  let calls = ref 0 in
+  let derived = map (fun v -> incr calls; v) (value input) in
+  let sub = subscribe ~emit_initial:false derived ignore in
+  set input 1; stabilize owner;
+  dispose_subscription sub;
+  let live_calls = !calls in
+  set input 2; stabilize owner;
+  require (!calls = live_calls) "orphaned derived kept recomputing";
+  let seen = ref [] in
+  let _sub = subscribe ~emit_initial:false derived (fun v -> seen := v :: !seen) in
+  set input 3; stabilize owner;
+  require (!seen = [3] && get derived = 3) "resubscribed derived missed a publication"
 
 let tests = ["notifications",notifications; "notification cancellation",notification_cancellation;
   "nested stabilize",nested_stabilize; "map2 construction",map2_construction;
@@ -243,7 +320,12 @@ let tests = ["notifications",notifications; "notification cancellation",notifica
   "switch construction reentry",switch_construction_reentry;
   "keyed first error",keyed_first_error;
   "switch subscription state",switch_subscription_state;
-  "registry bounds",registry_bounds]
+  "registry bounds",registry_bounds;
+  "observer consistent graph",observer_consistent_graph;
+  "transform reschedule",transform_reschedule;
+  "deep chain completes",deep_chain_completes;
+  "own cancel bound",own_cancel_bound;
+  "necessity release",necessity_release]
 
 let () =
   let failures = ref 0 in

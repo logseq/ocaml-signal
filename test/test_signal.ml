@@ -217,7 +217,7 @@ let test_scope_lifecycle_and_state_slots () =
   dispose_scope parent;
   dispose_scope parent;
   check_int "scope disposal releases state slots" 0
-    (Hashtbl.length slot.slot_states);
+    (state_slot_count slot);
   check_bool "disposed parent is inactive" false (active parent);
   check_bool "disposing parent disposes child" false (active child);
   check "scope lifecycle order"
@@ -438,6 +438,29 @@ let test_own_on_disposed_scope_disposes_subscription () =
   stabilize scheduler;
   Alcotest.(check (list int)) "owning on a disposed scope disposes" [] !seen
 
+let test_state_accessors () =
+  let sched = scheduler () in
+  let source = state sched 1 in
+  check_bool "signal_owner returns the scheduler" true
+    (signal_owner (value source) == sched);
+  Alcotest.(check (option int)) "no staged write" None
+    (state_pending source);
+  set source 5;
+  Alcotest.(check (option int)) "staged write visible before stabilize"
+    (Some 5) (state_pending source);
+  stabilize sched;
+  Alcotest.(check (option int)) "staged write consumed" None
+    (state_pending source);
+  check_bool "sources carry no upstream subscriptions" false
+    (has_upstream_subscriptions (value source));
+  let derived = map (fun v -> v + 1) (value source) in
+  let subscription = subscribe ~emit_initial:false derived (fun _ -> ()) in
+  check_bool "live derived holds upstream subscriptions" true
+    (has_upstream_subscriptions derived);
+  dispose_subscription subscription;
+  check_bool "dormant derived released upstream subscriptions" false
+    (has_upstream_subscriptions derived)
+
 let test_keyed_find_scope_missing_raises () =
   let scheduler = scheduler () in
   let parent = scope "list" in
@@ -604,8 +627,15 @@ let test_disposed_map2_skips_queued_transform () =
          dispose_signal derived));
   set input 1;
   stabilize owner;
-  check_int "disposed queued transform does not run" 1 !calls;
-  check_int "disposed signal keeps its final value" 1 (get derived)
+  (* Observers run after the computation phase, so the disposal lands after
+     this round's recompute; the released upstream subscription prevents the
+     next publication from rescheduling it. *)
+  check_int "computation finishes before the disposing observer" 2 !calls;
+  check_int "disposed signal keeps its final value" 2 (get derived);
+  set input 2;
+  stabilize owner;
+  check_int "disposed signal does not recompute" 2 !calls;
+  check_int "disposed signal ignores later publications" 2 (get derived)
 
 let test_late_on_mount () =
   let sc = scope "mounted" in
@@ -635,7 +665,7 @@ let test_switch_owned_by_parent () =
   stabilize owner;
   dispose_scope parent;
   check_bool "parent disposes the current branch" false
-    (active !(sw.switch_scope));
+    (active (switch_scope sw));
   dispose_switch sw;
   check_int "both branches unmount exactly once" 2 !unmounts
 
@@ -736,11 +766,9 @@ let test_keyed_function_payloads () =
 
 let test_insert_entry_clamps_indices () =
   let owner = scheduler () in
-  let entry key =
-    { entry_key = key; entry_state = state owner key; entry_scope = scope key }
-  in
+  let entry key = make_keyed_entry key (state owner key) (scope key) in
   let entries = [ entry "a"; entry "b" ] in
-  let keys entries = List.map (fun e -> e.entry_key) entries in
+  let keys entries = List.map keyed_entry_key entries in
   List.iter
     (fun (index, expected) ->
       check "clamped insertion" expected
@@ -757,11 +785,9 @@ let test_insert_entry_clamps_indices () =
 
 let test_move_entry_clamps_indices () =
   let owner = scheduler () in
-  let entry key =
-    { entry_key = key; entry_state = state owner key; entry_scope = scope key }
-  in
+  let entry key = make_keyed_entry key (state owner key) (scope key) in
   let entries = [ entry "a"; entry "b"; entry "c" ] in
-  let keys entries = List.map (fun e -> e.entry_key) entries in
+  let keys entries = List.map keyed_entry_key entries in
   List.iter
     (fun (from_index, to_index, expected) ->
       check "clamped movement preserves every entry" expected
@@ -850,5 +876,6 @@ let () =
             test_insert_entry_clamps_indices;
           Alcotest.test_case "move entry clamps indices" `Quick
             test_move_entry_clamps_indices;
+          Alcotest.test_case "state accessors" `Quick test_state_accessors;
         ] );
     ]

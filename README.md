@@ -35,31 +35,43 @@ dune runtest
 
 The library builds for native, bytecode, and Melange.
 
-## Scope record migration
+## Internal representation
 
-`scope` now contains an opaque `registry : scope_registry` field. Existing
-function signatures are unchanged. Prefer `Signal.scope name` or
-`Signal.make_scope name`; code that manually initializes the record must add
-`registry = Signal.make_scope_registry ()` with a fresh registry for each scope.
-Keep the existing unique scope id and fresh reference fields. Do not share
-registries between scopes or mutate lifecycle record fields directly.
+All record types are abstract in `src/signal.mli`; lifecycle state is exposed
+through accessors (`scope_name`, `scope_is_disposed`, `scope_cleanup_entries`,
+`scope_owned_entries`, `switch_scope`, `switch_is_disposed`,
+`switch_subscription`, `keyed_entries`, `keyed_is_disposed`,
+`make_keyed_entry`/`keyed_entry_*`, `state_slot_count`,
+`subscription_disposed`, `signal_is_disposed`). Use
+`Signal.scope_cleanup_count sc` (constant time) and
+`Signal.scope_owned_count sc` (a linear scan) for live counts — the entry
+lists may temporarily contain cancelled nodes until the next compaction.
 
-`cleanup_callbacks` and `owned_subscriptions` retain their list types, but may
-temporarily contain cancelled empty nodes. Replace
-`List.length !(sc.cleanup_callbacks)` with `Signal.scope_cleanup_count sc`
-(constant time), and use `Signal.scope_owned_count sc` for live owned handles
-(a linear scan). Cleanup cancellation immediately releases the callback's
-captured resources. Removing a switch or keyed lifetime similarly clears the
-owner's captured collection. Empty nodes are compacted when half of the stored
-registrations have been cancelled, avoiding a full list copy on every removal.
-The cleanup list contains at most twice as many nodes as live registrations,
-and registry metadata shrinks with that live count. Ordinary subscriptions passed
-to `own` remain owned until scope disposal; cancelling the original subscription
-does not by itself remove its owner node. `scope_owned_count` excludes it.
+Scopes keep no per-scope table: each cleanup entry shares its `disposed`
+reference with its cancellation handle, and the registry stores a handful of
+counters (`live_cleanups`, `cleanup_dead`, `owned_slots`, `owned_dead`,
+`owned_scan`). Cleanup cancellation immediately releases the callback's
+captured resources and counts a dead node; dead nodes are compacted when they
+outnumber live ones, so the cleanup list stays within twice the live
+registrations. `own` returns a counted handle so cancellations shrink the same
+bounded structure; handles cancelled outside their owned wrapper are swept
+when the stored list passes a scan watermark. Removing a switch or keyed
+lifetime clears the owner's captured collection.
 
-Subscriber failures notify the remaining live subscribers before propagating
-the first exception; call `stabilize` again to drain queued dependent work.
-Nested `stabilize` calls on the same scheduler leave work to the outer flush.
+Subscriber, switch, and keyed notifications run in an observer phase after
+all computations in the round settle, so observers always read a consistent
+graph; a `set` staged inside an observer runs in the next round. Subscriber
+failures notify the remaining live observers before propagating the first
+exception. A nested `stabilize` on the same scheduler drains the queues
+synchronously — event handlers can flush queued writes before reading
+derived state.
+
+Derived `map`/`map2`/`cutoff` nodes are tracked by necessity: when the last
+live subscriber cancels, the node releases its upstream subscriptions and
+stops recomputing; subscribing again reconnects it and recomputes on demand.
+Keep derived nodes owned (`own_signal`) or scoped so their lifetime matches
+their readers.
+
 Keyed callback failures finish resource accounting before propagating the first
 exception, but external patch side effects cannot be rolled back: patch consumers
 must resynchronize after a failed callback. Factories that raise before returning

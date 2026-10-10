@@ -486,12 +486,7 @@ let clamped_moves =
       let owner = scheduler () in
       let entries =
         List.map
-          (fun n ->
-            {
-              entry_key = n;
-              entry_state = state owner n;
-              entry_scope = scope "entry";
-            })
+          (fun n -> make_keyed_entry n (state owner n) (scope "entry"))
           items
       in
       let size = List.length items in
@@ -509,22 +504,14 @@ let clamped_moves =
       in
       let actual = move_entry entries from_index to_index in
       require
-        (List.map (fun entry -> entry.entry_key) actual = expected)
+        (List.map keyed_entry_key actual = expected)
         "clamped movement differs from the reference";
-      let inserted =
-        {
-          entry_key = 999;
-          entry_state = state owner 999;
-          entry_scope = scope "inserted";
-        }
-      in
+      let inserted = make_keyed_entry 999 (state owner 999) (scope "inserted") in
       let expected =
         array_insert (Array.of_list items) (max 0 (min to_index size)) 999
       in
       require
-        (List.map
-           (fun entry -> entry.entry_key)
-           (insert_entry_at entries to_index inserted)
+        (List.map keyed_entry_key (insert_entry_at entries to_index inserted)
         = Array.to_list expected)
         "clamped insertion differs from the reference")
 
@@ -550,19 +537,19 @@ let switch_lifetimes =
       let current = ref 0 and expected_mounts = ref 1 in
       List.iter
         (fun key ->
-          let previous = !(sw.switch_scope) in
+          let previous = switch_scope sw in
           set input key;
           stabilize owner;
           if equal !current key then
             require
-              (!(sw.switch_scope) == previous)
+              (switch_scope sw == previous)
               "equivalent key remounted its branch"
           else begin
             current := key;
             incr expected_mounts;
             require (not (active previous)) "replaced branch survived"
           end;
-          require (active !(sw.switch_scope)) "current branch is inactive";
+          require (active (switch_scope sw)) "current branch is inactive";
           int_equal "one mount per distinct key class" !expected_mounts !mounts;
           int_equal "one unmount per replaced branch" (!expected_mounts - 1)
             !unmounts)
@@ -598,7 +585,7 @@ let slot_lifetimes =
           int_equal "state slot isolation" expected (get_state input))
         children;
       dispose_scope parent;
-      int_equal "slot entries released" 0 (Hashtbl.length slot.slot_states);
+      int_equal "slot entries released" 0 (state_slot_count slot);
       List.iter
         (fun (child, input, _) ->
           (match state_at owner child slot 0 with
@@ -752,8 +739,9 @@ let scope_allocations =
             dispose_scope parent)
       in
       int_equal "all scopes unmount" size !unmounts;
-      (* Per-scope registry accounting adds bounded storage, independent of n. *)
-      allocation_budget "scopes" size 256 words)
+      (* Per-scope counter accounting adds bounded storage, independent of n;
+         measured at ~201 words per iteration. *)
+      allocation_budget "scopes" size 224 words)
 
 let logarithmic_depth size =
   let rec loop n depth =
@@ -826,7 +814,7 @@ let registry_cancellation =
         dispose_subscription handles.(i);
         let live = Array.fold_left (fun count dead -> if dead then count else count+1) 0 cancelled in
         int_equal "live registrations" live (scope_cleanup_count sc);
-        require (List.length !(sc.cleanup_callbacks) <= 2 * live) "unbounded tombstones") cancellations;
+        require (List.length (scope_cleanup_entries sc) <= 2 * live) "unbounded tombstones") cancellations;
       dispose_scope sc;
       Array.iteri (fun i count ->
         int_equal "uncancelled cleanup runs exactly once" (if cancelled.(i) then 0 else 1) count) calls;
