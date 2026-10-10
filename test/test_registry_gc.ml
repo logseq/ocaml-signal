@@ -4,7 +4,6 @@ let require condition message = if not condition then failwith message
 
 let cancelled_callback () =
   let parent = scope "retained owner" in
-  (* Keep two live registrations, so cancelling one entry leaves a tombstone. *)
   ignore (register_cleanup parent ignore);
   ignore (register_cleanup parent ignore);
   let weak = Weak.create 1 in
@@ -13,13 +12,30 @@ let cancelled_callback () =
     Weak.set weak 0 (Some payload);
     register_cleanup parent (fun () -> require (Bytes.length payload > 0) "payload")
   in
-  let retained_entry = List.hd !(parent.cleanup_callbacks) in
   dispose_subscription handle;
+  require (scope_cleanup_count parent = 2) "cancel did not unlink the cleanup";
   Gc.full_major ();
   require (not (Weak.check weak 0)) "cancelled cleanup retains captured payload";
-  require (List.length !(parent.cleanup_callbacks) = 3) "probe did not retain a tombstone";
-  retained_entry.cleanup_callback ();
-  dispose_subscription handle;
+  dispose_scope parent
+
+let child_scope_memory () =
+  let n = 20_000 in
+  Gc.compact ();
+  let before = (Gc.stat ()).live_words in
+  let parent = scope "parent" in
+  let kids =
+    Array.init n (fun _ ->
+        let child = child_scope "child" parent in
+        ignore (register_cleanup child ignore);
+        child)
+  in
+  Gc.compact ();
+  let words = float ((Gc.stat ()).live_words - before) /. float n in
+  (* A per-scope hash table measured about 139 words. The intrusive lists
+     must stay well under that. *)
+  require (words < 90.)
+    (Printf.sprintf "child scope with one cleanup retained %.1f words" words);
+  ignore (Sys.opaque_identity kids);
   dispose_scope parent
 
 let cancelled_collections () =
@@ -56,4 +72,5 @@ let () =
   cancelled_callback ();
   cancelled_collections ();
   registry_peak_storage ();
+  child_scope_memory ();
   print_endline "PASS cancelled callback payloads and collection records are collectible"

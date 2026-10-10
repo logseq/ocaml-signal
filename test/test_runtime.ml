@@ -32,10 +32,13 @@ let notification_cancellation () =
 let nested_stabilize () =
   List.iter (fun enqueue ->
     let owner = scheduler () and calls = ref [] in
-    enqueue owner (fun () -> calls := 1 :: !calls; stabilize owner);
+    enqueue owner (fun () ->
+      calls := 1 :: !calls;
+      stabilize owner;
+      require (List.rev !calls = [1; 2]) "nested stabilize returned before the later callback");
     enqueue owner (fun () -> calls := 2 :: !calls);
     stabilize owner;
-    require (List.rev !calls = [1;2] && generation owner = 1) "nested stabilize is not deferred to outer run";
+    require (List.rev !calls = [1;2]) "nested stabilize did not run the later callback";
     enqueue owner (fun () -> stabilize owner; failwith "expected");
     enqueue owner (fun () -> calls := 3 :: !calls);
     failure (fun () -> stabilize owner); stabilize owner;
@@ -45,10 +48,26 @@ let nested_stabilize () =
   stabilize outer; require (!calls = 1) "different scheduler nested flush blocked";
   let owner = scheduler () in
   let input = state owner 0 in
-  let a = map (fun v -> if v > 0 then stabilize owner; v+1) (value input) in
-  let b = map ((+) 2) (value input) in
-  let joined = map2 (+) a b in
-  set input 1; stabilize owner; require (get joined = 5) "derived nested flush changed dependency order"
+  enqueue_effect owner (fun () ->
+    set input 5;
+    stabilize owner;
+    require (get_state input = 5) "nested stabilize did not apply the queued write");
+  stabilize owner;
+  require (get_state input = 5) "outer stabilize dropped the nested write";
+  let owner = scheduler () in
+  let input = state owner 0 in
+  let seen_b = ref 0 in
+  let b = ref (constant owner 0) in
+  let a = map (fun v ->
+    if v > 0 then begin stabilize owner; seen_b := get !b end;
+    v + 1) (value input) in
+  b := map ((+) 2) (value input);
+  ignore (subscribe ~emit_initial:false a ignore);
+  ignore (subscribe ~emit_initial:false !b ignore);
+  set input 1; stabilize owner;
+  require (!seen_b = 3) "nested stabilize left a same-rank sibling stale";
+  let joined = map2 (+) a !b in
+  require (get joined = 5) "derived nested flush changed dependency order"
 
 let map2_construction () =
   List.iter (fun dead_on_left ->
@@ -96,7 +115,7 @@ let keyed_failures () =
           | _ -> ()) in
     armed := true; set input [3;4]; failure (fun () -> stabilize owner);
     armed := false; stabilize owner;
-    require (List.for_all (fun e -> active e.entry_scope) !(k.keyed_entries)) "failed reconcile retained disposed entry";
+    require (List.for_all (fun e -> active (entry_scope e)) (keyed_entries k)) "failed reconcile retained disposed entry";
     set input [2]; stabilize owner;
     require (active (keyed_find_scope k 2)) "valid later edit reused disposed scope";
     dispose_scope parent;
@@ -132,9 +151,9 @@ let ownership_churn () =
   for _ = 1 to 256 do
     let sw = switch parent input (=) (fun _ -> scope "branch") in dispose_switch sw;
     let k = keyed parent input Fun.id Int.compare (fun _ -> scope "item") ignore in dispose_keyed k;
-    require (!(k.keyed_entries) = []) "disposed collection retains item payloads"
+    require (keyed_entries k = []) "disposed collection retains item payloads"
   done;
-  require (List.length !(parent.owned_subscriptions) <= 1) "owner retains history of disposed collection handles";
+  require (scope_owned_count parent <= 1) "owner retains history of disposed collection handles";
   dispose_scope parent
 
 let switch_mount_retry () =
@@ -145,7 +164,7 @@ let switch_mount_retry () =
       on_unmount sc (fun () -> if key=1 && !armed then failwith "cleanup"); sc) in
   set input 1; failure (fun () -> stabilize owner);
   armed := false; set input 1; stabilize owner;
-  require (active !(sw.switch_scope)) "same key failed to retry a failed mount";
+  require (active (switch_scope sw)) "same key failed to retry a failed mount";
   dispose_scope parent
 
 let comparator_failure_after_remove () =
@@ -165,7 +184,7 @@ let public_reconcile_reentry () =
   let mount _ = let sc = scope "item" in made := sc :: !made; sc in
   invalid (fun () -> reconcile_keyed owner entries [1] Fun.id Int.compare mount
       (fun _ -> reconcile_keyed owner entries [2] Fun.id Int.compare mount ignore));
-  List.iter (fun entry -> dispose_scope entry.entry_scope) !entries;
+  List.iter (fun entry -> dispose_scope (entry_scope entry)) !entries;
   require (List.for_all (fun sc -> not (active sc)) !made) "public reconcile reentry lost inner scope"
 
 let switch_construction_reentry () =
@@ -177,15 +196,15 @@ let switch_construction_reentry () =
         let advance () = if key < 2 then (set input (key+1); stabilize owner) in
         if phase=0 then advance () else on_mount sc advance;
         sc) in
-    require ((!(sw.switch_scope)).scope_name = "2") "switch missed publication during construction";
-    require (active !(sw.switch_scope)) "switch construction returned inactive branch";
+    require (scope_name (switch_scope sw) = "2") "switch missed publication during construction";
+    require (active (switch_scope sw)) "switch construction returned inactive branch";
     dispose_scope parent;
-    require (List.for_all (fun sc -> !(sc.disposed_scope)) !made) "construction reentry orphaned branch") [0;1];
+    require (List.for_all scope_disposed !made) "construction reentry orphaned branch") [0;1];
   let parent = scope "parent" and owner = scheduler () and made = ref None in
   let sw = switch parent (constant owner 0) (=) (fun _ ->
       dispose_scope parent; let sc = scope "late" in made := Some sc; sc) in
-  require (!(sw.switch_disposed)) "factory disposal did not cancel switch";
-  require (match !made with Some sc -> !(sc.disposed_scope) | None -> false) "factory returned scope after parent disposal leaked"
+  require (switch_disposed sw) "factory disposal did not cancel switch";
+  require (match !made with Some sc -> scope_disposed sc | None -> false) "factory returned scope after parent disposal leaked"
 
 let keyed_first_error () =
   let owner = scheduler () and parent = scope "parent" and armed = ref false in
@@ -204,7 +223,7 @@ let switch_subscription_state () =
   let source = constant owner 0 in
   let sw = switch parent source (=) (fun _ -> scope "branch") in
   dispose_signal source;
-  require (!(sw.switch_subscription.disposed)) "switch subscription lost source cancellation state";
+  require (subscription_disposed (switch_subscription sw)) "switch subscription lost source cancellation state";
   dispose_scope parent
 
 let registry_bounds () =
@@ -213,8 +232,7 @@ let registry_bounds () =
   for i=0 to 63 do
     let index = (i * 17) mod 64 in
     dispose_subscription handles.(index);
-    require (scope_cleanup_count sc = 63-i) "cleanup live count drifted";
-    require (List.length !(sc.cleanup_callbacks) <= 2 * (63-i)) "cleanup tombstones exceed bound"
+    require (scope_cleanup_count sc = 63-i) "cleanup live count drifted"
   done;
   dispose_scope sc;
   require (!calls = []) "cancelled callback ran after compaction";
@@ -223,15 +241,85 @@ let registry_bounds () =
   let switches = Array.init 64 (fun _ -> switch parent source (=) (fun _ -> scope "branch")) in
   for i=0 to 63 do
     dispose_switch switches.((i * 17) mod 64);
-    require (scope_owned_count parent = 63-i) "owner live count drifted";
-    require (List.length !(parent.owned_subscriptions) <= 2 * (63-i)) "owner tombstones exceed bound"
+    require (scope_owned_count parent = 63-i) "owner live count drifted"
   done;
   dispose_scope parent;
   let parent = scope "direct-cancel" in
   let sw = switch parent source (=) (fun _ -> scope "branch") in
-  dispose_subscription (List.hd !(parent.owned_subscriptions));
-  require (!(sw.switch_disposed) && not (active !(sw.switch_scope))) "owner handle cancellation leaked branch";
+  dispose_subscription (switch_subscription sw);
+  require (switch_disposed sw && not (active (switch_scope sw))) "owner handle cancellation leaked branch";
   dispose_scope parent
+
+let observer_sees_settled_derived () =
+  let owner = scheduler () in
+  let input = state owner 0 in
+  let b = map succ (value input) in
+  let c = map (fun x -> x * 2) b in
+  let seen = ref None in
+  ignore (subscribe ~emit_initial:false b (fun bv -> seen := Some (bv, get c)));
+  set input 5;
+  stabilize owner;
+  require (!seen = Some (6, 12)) "observer saw a stale derived value";
+  let root = scope "root" in
+  mount root;
+  let key = state owner 0 in
+  let label = map (fun k -> "label-" ^ string_of_int k) (value key) in
+  let sampled = ref "" in
+  ignore
+    (switch root (value key) ( = ) (fun _ ->
+         let branch = child_scope "branch" root in
+         sampled := get label;
+         branch));
+  set key 1;
+  stabilize owner;
+  require (!sampled = "label-1") "switch mount read a stale derived label"
+
+let unobserved_map_stops () =
+  let owner = scheduler () in
+  let global = state owner 0 in
+  let calls = ref 0 in
+  for _ = 1 to 1000 do
+    let branch = scope "branch" in
+    let derived = map (fun v -> incr calls; v + 1) (value global) in
+    ignore (own branch (observe derived ignore));
+    dispose_scope branch
+  done;
+  calls := 0;
+  set global 1;
+  stabilize owner;
+  require (!calls = 0) "unobserved map recomputed after dispose"
+
+let failed_transform_is_retried () =
+  let owner = scheduler () in
+  let input = state owner 0 in
+  let fail = ref true in
+  let calls = ref 0 in
+  let derived =
+    map
+      (fun v ->
+        incr calls;
+        if !fail && v = 1 then failwith "transform" else v * 10)
+      (value input)
+  in
+  ignore (subscribe ~emit_initial:false derived ignore);
+  set input 1;
+  (match stabilize owner with
+  | () -> failwith "transform exception did not propagate"
+  | exception Failure _ -> ());
+  fail := false;
+  stabilize owner;
+  require (get derived = 10) "failed computation was not retried without a new write";
+  require (!calls = 3) "retried transform did not run once after the failure"
+
+let mount_continues_after_exception () =
+  let sc = scope "mount" in
+  let ran = ref false in
+  on_mount sc (fun () -> failwith "hook");
+  on_mount sc (fun () -> ran := true);
+  (match mount sc with
+  | () -> failwith "mount exception did not propagate"
+  | exception Failure _ -> ());
+  require (!ran && scope_mounted sc) "later mount callback was skipped"
 
 let tests = ["notifications",notifications; "notification cancellation",notification_cancellation;
   "nested stabilize",nested_stabilize; "map2 construction",map2_construction;
@@ -243,7 +331,11 @@ let tests = ["notifications",notifications; "notification cancellation",notifica
   "switch construction reentry",switch_construction_reentry;
   "keyed first error",keyed_first_error;
   "switch subscription state",switch_subscription_state;
-  "registry bounds",registry_bounds]
+  "registry bounds",registry_bounds;
+  "observer sees settled derived",observer_sees_settled_derived;
+  "unobserved map stops",unobserved_map_stops;
+  "failed transform is retried",failed_transform_is_retried;
+  "mount continues after exception",mount_continues_after_exception]
 
 let () =
   let failures = ref 0 in

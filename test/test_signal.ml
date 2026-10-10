@@ -216,8 +216,7 @@ let test_scope_lifecycle_and_state_slots () =
   check_int "reused state slot ignores new initializer" 9 (get_state second_state);
   dispose_scope parent;
   dispose_scope parent;
-  check_int "scope disposal releases state slots" 0
-    (Hashtbl.length slot.slot_states);
+  check_int "scope disposal releases state slots" 0 (state_slot_count slot);
   check_bool "disposed parent is inactive" false (active parent);
   check_bool "disposing parent disposes child" false (active child);
   check "scope lifecycle order"
@@ -491,9 +490,11 @@ let test_stabilization_recovers_after_transform_exception () =
   let input = state owner 0 in
   let should_raise = ref true in
   ignore
-    (map
-       (fun v -> if v = 1 && !should_raise then failwith "transform" else v)
-       (value input));
+    (subscribe ~emit_initial:false
+       (map
+          (fun v -> if v = 1 && !should_raise then failwith "transform" else v)
+          (value input))
+       ignore);
   let derived = map (fun v -> v * 2) (value input) in
   set input 1;
   (match stabilize owner with
@@ -635,7 +636,7 @@ let test_switch_owned_by_parent () =
   stabilize owner;
   dispose_scope parent;
   check_bool "parent disposes the current branch" false
-    (active !(sw.switch_scope));
+    (active (switch_scope sw));
   dispose_switch sw;
   check_int "both branches unmount exactly once" 2 !unmounts
 
@@ -734,48 +735,20 @@ let test_keyed_function_payloads () =
     (snd (get (List.assoc "a" !signals)) ());
   dispose_keyed collection
 
-let test_insert_entry_clamps_indices () =
-  let owner = scheduler () in
-  let entry key =
-    { entry_key = key; entry_state = state owner key; entry_scope = scope key }
+let test_deep_acyclic_chain_does_not_hit_round_cap () =
+  let scheduler = scheduler () in
+  let input = state scheduler 0 in
+  let depth = 10001 in
+  let rec build n signal =
+    if n = 0 then signal else build (n - 1) (map succ signal)
   in
-  let entries = [ entry "a"; entry "b" ] in
-  let keys entries = List.map (fun e -> e.entry_key) entries in
-  List.iter
-    (fun (index, expected) ->
-      check "clamped insertion" expected
-        (keys (insert_entry_at entries index (entry "c"))))
-    [
-      (-1, [ "c"; "a"; "b" ]);
-      (0, [ "c"; "a"; "b" ]);
-      (1, [ "a"; "c"; "b" ]);
-      (2, [ "a"; "b"; "c" ]);
-      (100, [ "a"; "b"; "c" ]);
-    ];
-  check "empty insertion clamps" [ "c" ]
-    (keys (insert_entry_at [] 100 (entry "c")))
-
-let test_move_entry_clamps_indices () =
-  let owner = scheduler () in
-  let entry key =
-    { entry_key = key; entry_state = state owner key; entry_scope = scope key }
-  in
-  let entries = [ entry "a"; entry "b"; entry "c" ] in
-  let keys entries = List.map (fun e -> e.entry_key) entries in
-  List.iter
-    (fun (from_index, to_index, expected) ->
-      check "clamped movement preserves every entry" expected
-        (keys (move_entry entries from_index to_index)))
-    [
-      (0, 100, [ "b"; "c"; "a" ]);
-      (2, -1, [ "c"; "a"; "b" ]);
-      (-1, 2, [ "b"; "c"; "a" ]);
-      (100, 0, [ "c"; "a"; "b" ]);
-      (1, 1, [ "a"; "b"; "c" ]);
-    ];
-  check "empty movement is a no-op" [] (keys (move_entry [] 100 (-1)));
-  check "singleton movement preserves its entry" [ "a" ]
-    (keys (move_entry [ entry "a" ] 100 (-1)))
+  let last = build depth (value input) in
+  ignore (subscribe ~emit_initial:false last ignore);
+  set input 1;
+  stabilize scheduler;
+  check_int "deep acyclic chain settles" (depth + 1) (get last);
+  check_bool "rank depth does not consume the runaway cap" true
+    ((last_stabilization scheduler).stabilization_rounds > max_stabilization_rounds)
 
 let () =
   Alcotest.run "ocaml-signal"
@@ -846,9 +819,7 @@ let () =
             test_keyed_pending_item_update;
           Alcotest.test_case "keyed function payloads" `Quick
             test_keyed_function_payloads;
-          Alcotest.test_case "insert entry clamps indices" `Quick
-            test_insert_entry_clamps_indices;
-          Alcotest.test_case "move entry clamps indices" `Quick
-            test_move_entry_clamps_indices;
+          Alcotest.test_case "deep acyclic chain does not hit the round cap"
+            `Quick test_deep_acyclic_chain_does_not_hit_round_cap;
         ] );
     ]
