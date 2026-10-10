@@ -14,106 +14,43 @@ type stabilization_diagnostics = {
   stabilization_dirty_tasks : int;
 }
 
-(** FIFO computation queues indexed by dependency rank. *)
-type computation_queue
-
-(** Owns the effect, dirty-task, and computation queues shared by every signal created
-    through it. Signals and scopes created on different schedulers must not be
-    combined. *)
-type scheduler = {
-  effects : (unit -> unit) Queue.t;
-  dirty : (unit -> unit) Queue.t;
-  computations : computation_queue ref;
-  (** Derived tasks paired with their dependency rank. *)
-  generation_value : int ref;
-  last_stabilization_value : stabilization_diagnostics ref;
-}
+(** Owns the effect, dirty-task, computation, and observer queues shared by
+    every signal created through it. Signals and scopes created on different
+    schedulers must not be combined. *)
+type scheduler
 
 (** A cancellable handle returned by {!observe}, {!subscribe}, and
     {!register_cleanup}. *)
-type subscription = { disposed : bool ref; cancel : unit -> unit }
-
-(** A registered signal callback. *)
-type 'value subscriber = {
-  subscriber_id : int;
-  mutable callback : 'value -> unit;
-  subscriber_disposed : bool ref;
-  mutable previous : 'value subscriber option;
-  mutable next : 'value subscriber option;
-}
-
-(** Subscriber registry with constant-time registration and cancellation. *)
-type 'value subscribers
+type subscription
 
 (** A registered scope cleanup callback. *)
-type cleanup_entry = { cleanup_id : int; cleanup_callback : unit -> unit }
+type cleanup_entry
 
 (** {1 Signals and states} *)
 
 (** A reactive value. Reading it never triggers recomputation; subscribers are
     notified when {!stabilize} publishes a new current value. *)
-type 'value signal = {
-  owner : scheduler;
-  rank : int;
-  (** Dependency depth; constants and states have rank [0]. *)
-  current : 'value ref;
-  next_subscriber_id : int ref;
-  subscribers : 'value subscribers;
-  upstream_subscriptions : subscription list ref;
-  disposed_signal : bool ref;
-}
+type 'value signal
 
 (** Mutable input for the graph. {!set} and {!update} stage a pending value
     that is published on the next {!stabilize}. *)
-type 'value state = {
-  state_signal : 'value signal;
-  pending : 'value option ref;
-  scheduled : bool ref;
-}
+type 'value state
 
 (** {1 Scopes} *)
 
-(** Private accounting for bounded deferred removal of cancelled handles. *)
-type scope_registry
-
-(** Creates fresh accounting for a manually constructed {!scope} record.
-    Prefer {!val-scope} or {!make_scope}; do not share a registry across scopes. *)
-val make_scope_registry : unit -> scope_registry
-
 (** Lifecycle boundary for subscriptions, signals, cleanups, and per-scope
     state slots. Disposing a scope disposes everything it owns. *)
-type scope = {
-  scope_id : int;
-  scope_name : string;
-  next_cleanup_id : int ref;
-  cleanup_callbacks : cleanup_entry list ref;
-  mount_callbacks : (unit -> unit) list ref;
-  unmount_callbacks : (unit -> unit) list ref;
-  owned_subscriptions : subscription list ref;
-  registry : scope_registry;
-  (** Internal accounting. The list fields may contain cancelled empty nodes;
-      use {!scope_cleanup_count} and {!scope_owned_count} for live counts.
-      Treat lifecycle record fields as read-only. *)
-  mounted : bool ref;
-  disposed_scope : bool ref;
-}
+type scope
 
 (** A named slot template. {!state_at} materializes one ['value state] per
     scope id, removed when the scope is disposed. *)
-type 'value state_slot = {
-  slot_name : string;
-  slot_states : (int, 'value state) Hashtbl.t;
-}
+type 'value state_slot
 
 (** {1 Switch} *)
 
 (** Keeps exactly one mounted child scope alive for the current key of a
     signal. *)
-type 'key switch = {
-  switch_subscription : subscription;
-  switch_scope : scope ref;
-  switch_disposed : bool ref;
-}
+type 'key switch
 
 (** {1 Keyed collections} *)
 
@@ -125,19 +62,10 @@ type 'key keyed_patch =
   | Move of 'key * int * int
 
 (** One reconciled collection item: its key, backing state, and scope. *)
-type ('key, 'item) keyed_entry = {
-  entry_key : 'key;
-  entry_state : 'item state;
-  entry_scope : scope;
-}
+type ('key, 'item) keyed_entry
 
 (** A reconciled collection with one scope per item. *)
-type ('key, 'item) keyed = {
-  keyed_subscription : subscription;
-  keyed_entries : ('key, 'item) keyed_entry list ref;
-  keyed_compare : 'key -> 'key -> int;
-  keyed_disposed : bool ref;
-}
+type ('key, 'item) keyed
 
 (** {1 Scheduler operations} *)
 
@@ -173,15 +101,17 @@ exception Stabilization_limit_exceeded of int * int * int
     {!Stabilization_limit_exceeded}. *)
 val max_stabilization_rounds : int
 
-(** [stabilize owner] drains the effect and dirty queues to a fixpoint: each
-    round runs all queued effects, then all dirty tasks. Once mutations settle,
-    derived signals recompute in dependency order, one rank per round, repeating
-    until all queues are empty. Unexecuted tasks are preserved if a callback
+(** [stabilize owner] drains the work queues to a fixpoint: each round runs all
+    queued effects, then all dirty tasks. Once mutations settle, derived
+    signals recompute in dependency order — every rank in a single pass — and
+    observer callbacks (subscribers, switch, and keyed notifications) run last,
+    so observers always read a consistent graph. A [set] staged by an observer
+    runs in the next round. Unexecuted tasks are preserved if a callback
     raises; the exception propagates to the caller. On successful completion,
     increments {!generation} when at least one task ran and updates
     {!last_stabilization}.
-    A synchronous nested call on the same scheduler returns immediately;
-    the outer call drains any newly queued work. Other schedulers may be flushed.
+    A synchronous nested call on the same scheduler drains the queues itself:
+    tasks and observers may flush pending writes before reading derived state.
     @raise Stabilization_limit_exceeded on a runaway loop. *)
 val stabilize : scheduler -> unit
 
@@ -213,8 +143,10 @@ val set : 'value state -> 'value -> unit
 (** [update st f] stages [f] applied to the current value. *)
 val update : 'value state -> ('value -> 'value) -> unit
 
-(** [subscribe ?emit_initial sig callback] registers [callback] to run at
-    every publish. When [emit_initial] is [true] (the default) the callback
+(** [subscribe ?emit_initial sig callback] registers [callback] as an observer
+    notified at every publish; observer callbacks run after the computation
+    phase of the round that publishes them, so a callback always reads a
+    settled graph. When [emit_initial] is [true] (the default) the callback
     also runs synchronously with the current value.
     If the initial callback raises, its registration is cancelled before the
     exception propagates; other subscriptions remain registered.
@@ -226,27 +158,43 @@ val subscribe : ?emit_initial:bool -> 'value signal -> ('value -> unit) -> subsc
 (** [observe sig callback] is [subscribe ~emit_initial:true]. *)
 val observe : 'value signal -> ('value -> unit) -> subscription
 
+(** [make_subscription cancel] builds a subscription that runs [cancel] once
+    when disposed; for callers that supply their own cancel handle (tests,
+    adapters over external resources). *)
+val make_subscription : (unit -> unit) -> subscription
+
 (** [dispose_subscription sub] cancels a subscription; idempotent. *)
 val dispose_subscription : subscription -> unit
+
+(** [subscription_disposed sub] is [true] once [sub] has been cancelled. *)
+val subscription_disposed : subscription -> bool
 
 (** [dispose_signal sig] disposes the signal, cancelling its subscribers and
     upstream subscriptions; idempotent.
     Raises [Invalid_argument] on subsequent {!observe}/{!subscribe}. *)
 val dispose_signal : 'value signal -> unit
 
+(** [signal_is_disposed sig] is [true] once [sig] has been disposed. *)
+val signal_is_disposed : 'value signal -> bool
+
 (** [map f sig] derives a signal publishing [f] applied to each new value of
     [sig].
+    A derived node recomputes only while needed: it stops resubscribing to its
+    inputs once its last live subscriber cancels, and recomputes on demand when
+    subscribed again. Derived nodes should therefore be owned ({!own_signal})
+    or scoped so their lifetime matches the readers that need them.
     Raises [Invalid_argument] when [sig] is already disposed. *)
 val map : ('left -> 'output) -> 'left signal -> 'output signal
 
 (** [map2 f left right] derives a signal publishing [f] applied to the latest
     settled values of both inputs. Both signals must share one scheduler.
+    The same necessity rule as {!map} applies.
     Raises [Invalid_argument] when the schedulers differ or either input is
     disposed. *)
 val map2 : ('left -> 'right -> 'output) -> 'left signal -> 'right signal -> 'output signal
 
 (** [cutoff equal sig] derives a signal that republishes only when [equal
-    old new] is [false]. *)
+    old new] is [false]. The same necessity rule as {!map} applies. *)
 val cutoff : ('value -> 'value -> bool) -> 'value signal -> 'value signal
 
 (** {1 Scope operations} *)
@@ -260,6 +208,28 @@ val child_scope : string -> scope -> scope
 
 (** [make_scope name] is {!val-scope}; kept for API parity. *)
 val make_scope : string -> scope
+
+(** [scope_id sc] is the unique id assigned at creation. *)
+val scope_id : scope -> int
+
+(** [scope_name sc] is the name passed at creation. *)
+val scope_name : scope -> string
+
+(** [scope_is_disposed sc] is [true] once [sc] has been disposed. *)
+val scope_is_disposed : scope -> bool
+
+(** [scope_cleanup_entries sc] is the stored cleanup list; cancelled entries
+    may remain until the next compaction — use {!scope_cleanup_count} for the
+    live count. *)
+val scope_cleanup_entries : scope -> cleanup_entry list
+
+(** [scope_owned_entries sc] is the stored owned-handle list; cancelled handles
+    may remain until the next compaction — use {!scope_owned_count} for the
+    live count. *)
+val scope_owned_entries : scope -> subscription list
+
+(** [cleanup_entry_run entry] runs [entry]'s registered callback. *)
+val cleanup_entry_run : cleanup_entry -> unit
 
 (** Number of live cleanup registrations; constant time. *)
 val scope_cleanup_count : scope -> int
@@ -281,13 +251,15 @@ val on_dispose : scope -> (unit -> unit) -> unit
 (** [register_cleanup sc f] registers [f] and returns a {!subscription} that
     cancels it, including cancellation by an earlier cleanup during disposal.
     Cancellation immediately releases [f]'s captured resources. Cancelled empty
-    nodes are compacted when at least half the list is dead, giving amortized
+    nodes are compacted when dead nodes outnumber live ones, giving amortized
     constant-time cancellation and at most twice as many stored nodes as live
     registrations. *)
 val register_cleanup : scope -> (unit -> unit) -> subscription
 
 (** [own sc sub] ties [sub]'s lifetime to [sc]; on a disposed scope [sub] is
-    cancelled immediately. *)
+    cancelled immediately. The returned handle is equivalent to [sub] and
+    additionally lets the scope count cancellations so dead handles are
+    swept within a bounded factor of the live set. *)
 val own : scope -> subscription -> subscription
 
 (** [own_signal sc sig] ties [sig]'s lifetime to [sc]. *)
@@ -307,6 +279,10 @@ val active : scope -> bool
 
 (** [state_slot name] creates a slot template for {!state_at}. *)
 val state_slot : string -> 'value state_slot
+
+(** [state_slot_count slot] is the number of scopes currently materialized
+    in [slot]. *)
+val state_slot_count : 'value state_slot -> int
 
 (** [state_at owner sc slot initial] returns the per-scope state for [slot] in
     [sc], creating it with [initial] on first use; the entry is removed when
@@ -333,6 +309,15 @@ val switch : scope -> 'key signal -> ('key -> 'key -> bool) -> ('key -> scope) -
     idempotent. *)
 val dispose_switch : 'key switch -> unit
 
+(** [switch_scope sw] is the currently mounted child scope. *)
+val switch_scope : 'key switch -> scope
+
+(** [switch_is_disposed sw] is [true] once [sw] has been disposed. *)
+val switch_is_disposed : 'key switch -> bool
+
+(** [switch_subscription sw] is the source subscription driving [sw]. *)
+val switch_subscription : 'key switch -> subscription
+
 (** {1 Keyed collection operations} *)
 
 (** [find_entry_index entries key compare] is the index of the entry whose key
@@ -342,6 +327,26 @@ val find_entry_index : ('key, 'item) keyed_entry list -> 'key -> ('key -> 'key -
 (** [key_index items key_of compare] builds a key-to-index lookup for [items].
     Raises [Invalid_argument] on duplicate keys. *)
 val key_index : 'item list -> ('item -> 'key) -> ('key -> 'key -> int) -> 'key -> int option
+
+(** [make_keyed_entry key item_state entry_scope] builds a {!keyed_entry} for
+    tests and custom reconcilers; entries returned by {!keyed_entries} come
+    from the runtime. *)
+val make_keyed_entry : 'key -> 'item state -> scope -> ('key, 'item) keyed_entry
+
+(** [keyed_entry_key entry] is the reconciled key. *)
+val keyed_entry_key : ('key, 'item) keyed_entry -> 'key
+
+(** [keyed_entry_state entry] is the backing item state. *)
+val keyed_entry_state : ('key, 'item) keyed_entry -> 'item state
+
+(** [keyed_entry_scope entry] is the mounted item scope. *)
+val keyed_entry_scope : ('key, 'item) keyed_entry -> scope
+
+(** [keyed_entries k] is the current entry list of the collection. *)
+val keyed_entries : ('key, 'item) keyed -> ('key, 'item) keyed_entry list
+
+(** [keyed_is_disposed k] is [true] once [k] has been disposed. *)
+val keyed_is_disposed : ('key, 'item) keyed -> bool
 
 (** [remove_entry_at entries i] drops the entry at index [i]. *)
 val remove_entry_at : ('key, 'item) keyed_entry list -> int -> ('key, 'item) keyed_entry list

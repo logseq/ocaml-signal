@@ -13,12 +13,12 @@ let cancelled_callback () =
     Weak.set weak 0 (Some payload);
     register_cleanup parent (fun () -> require (Bytes.length payload > 0) "payload")
   in
-  let retained_entry = List.hd !(parent.cleanup_callbacks) in
+  let retained_entry = List.hd (scope_cleanup_entries parent) in
   dispose_subscription handle;
   Gc.full_major ();
   require (not (Weak.check weak 0)) "cancelled cleanup retains captured payload";
-  require (List.length !(parent.cleanup_callbacks) = 3) "probe did not retain a tombstone";
-  retained_entry.cleanup_callback ();
+  require (List.length (scope_cleanup_entries parent) = 3) "probe did not retain a tombstone";
+  cleanup_entry_run retained_entry;
   dispose_subscription handle;
   dispose_scope parent
 

@@ -13,6 +13,7 @@ type scheduler = {
   effects : (unit -> unit) Queue.t;
   dirty : (unit -> unit) Queue.t;
   computations : computation_queue ref;
+  observers : (unit -> unit) Queue.t;
   generation_value : int ref;
   last_stabilization_value : stabilization_diagnostics ref;
 }
@@ -20,9 +21,9 @@ type scheduler = {
 type subscription = { disposed : bool ref; cancel : unit -> unit }
 
 type 'value subscriber = {
-  subscriber_id : int;
   mutable callback : 'value -> unit;
   subscriber_disposed : bool ref;
+  subscriber_observer : bool;
   mutable previous : 'value subscriber option;
   mutable next : 'value subscriber option;
 }
@@ -32,15 +33,19 @@ type 'value subscribers = {
   mutable last : 'value subscriber option;
 }
 
-type cleanup_entry = { cleanup_id : int; cleanup_callback : unit -> unit }
+type cleanup_entry = {
+  cleanup_live : bool ref;
+  cleanup_callback : unit -> unit;
+}
 
 type 'value signal = {
   owner : scheduler;
   rank : int;
   current : 'value ref;
-  next_subscriber_id : int ref;
   subscribers : 'value subscribers;
   upstream_subscriptions : subscription list ref;
+  live_subscribers : int ref;
+  reconnect : (unit -> unit) option ref;
   disposed_signal : bool ref;
 }
 
@@ -50,24 +55,31 @@ type 'value state = {
   scheduled : bool ref;
 }
 
+(* Bounded deferred-removal accounting: [live_cleanups] counts registered
+   callbacks, [cleanup_dead] counts cancelled list nodes awaiting compaction,
+   [owned_slots] is the owned list length, [owned_dead] counts cancellations
+   reported through owned handles, and [owned_scan] is the list length that
+   triggers a sweep for cancellations reported through raw handles. *)
 type scope_registry = {
-  live_cleanups : (int, unit) Hashtbl.t;
-  mutable cleanup_slots : int;
+  mutable live_cleanups : int;
+  mutable cleanup_dead : int;
   mutable owned_slots : int;
-  mutable cancelled_owned : int;
+  mutable owned_dead : int;
+  mutable owned_scan : int;
 }
 
-let make_scope_registry () = {
-  live_cleanups = Hashtbl.create 0;
-  cleanup_slots = 0;
-  owned_slots = 0;
-  cancelled_owned = 0;
-}
+let make_scope_registry () =
+  {
+    live_cleanups = 0;
+    cleanup_dead = 0;
+    owned_slots = 0;
+    owned_dead = 0;
+    owned_scan = 64;
+  }
 
 type scope = {
   scope_id : int;
   scope_name : string;
-  next_cleanup_id : int ref;
   cleanup_callbacks : cleanup_entry list ref;
   mount_callbacks : (unit -> unit) list ref;
   unmount_callbacks : (unit -> unit) list ref;
@@ -78,7 +90,6 @@ type scope = {
 }
 
 type 'value state_slot = {
-  slot_name : string;
   slot_states : (int, 'value state) Hashtbl.t;
 }
 
@@ -111,6 +122,7 @@ let scheduler () =
     effects = Queue.create ();
     dirty = Queue.create ();
     computations = ref Rank_map.empty;
+    observers = Queue.create ();
     generation_value = ref 0;
     last_stabilization_value =
       ref
@@ -139,7 +151,7 @@ let schedule_once owner scheduled task =
         task ())
   end
 
-let schedule_computation reactive scheduled task =
+let rec schedule_computation reactive scheduled task =
   if not !scheduled then begin
     scheduled := true;
     let queue =
@@ -154,20 +166,39 @@ let schedule_computation reactive scheduled task =
     Queue.add
       (fun () ->
         scheduled := false;
-        if not !(reactive.disposed_signal) then task ())
+        if
+          not !(reactive.disposed_signal)
+          && !(reactive.upstream_subscriptions) <> []
+        then
+          try task ()
+          with exn ->
+            (* Keep the node stale: requeue the failed computation so the next
+               stabilize recomputes it, then propagate the failure. *)
+            schedule_computation reactive scheduled task;
+            raise exn)
       queue
   end
 
 let run_tasks queue count run =
   (* Taking only the snapshot length leaves new work for the next round and
-     keeps unexecuted tasks queued if a callback raises. *)
-  for _ = 1 to count do
+     keeps unexecuted tasks queued if a callback raises. A nested stabilize
+     may have drained the queue first, so stop at empty instead of raising
+     Queue.Empty. *)
+  let remaining = ref count in
+  while !remaining > 0 && not (Queue.is_empty queue) do
+    decr remaining;
     run (Queue.take queue)
   done
 
 let prune_computation_queue owner rank queue =
+  (* A nested stabilize may already have drained and pruned this rank and new
+     work may have rebuilt it; only remove the entry while the map still holds
+     this exact queue. *)
   if Queue.is_empty queue then
-    owner.computations := Rank_map.remove rank !(owner.computations)
+    match Rank_map.find_opt rank !(owner.computations) with
+    | Some current when current == queue ->
+        owner.computations := Rank_map.remove rank !(owner.computations)
+    | _ -> ()
 
 let max_stabilization_rounds = 10000
 
@@ -182,8 +213,11 @@ let stabilize_impl owner =
   while !continue do
     let effects = Queue.length owner.effects in
     let dirty = Queue.length owner.dirty in
-    if effects = 0 && dirty = 0 && Rank_map.is_empty !(owner.computations) then
-      continue := false
+    if
+      effects = 0 && dirty = 0
+      && Rank_map.is_empty !(owner.computations)
+      && Queue.is_empty owner.observers
+    then continue := false
     else begin
       worked := true;
       incr rounds;
@@ -198,20 +232,31 @@ let stabilize_impl owner =
       run_tasks owner.dirty pending_dirty (fun task ->
           incr dirty_count;
           task ());
-      if
-        effects = 0 && pending_dirty = 0
-        && not (Rank_map.is_empty !(owner.computations))
-      then begin
-        (* Settle mutations first, then recompute one dependency rank per round. *)
-        let rank, queue = Rank_map.min_binding !(owner.computations) in
-        (try
-          run_tasks queue (Queue.length queue) (fun task ->
-              incr dirty_count;
-              task ())
-        with exn ->
-          prune_computation_queue owner rank queue;
-          raise exn);
-        prune_computation_queue owner rank queue
+      if effects = 0 && pending_dirty = 0 then begin
+        (* Mutations settled: recompute the whole graph in dependency order —
+           every rank in one pass so the round cap measures real divergence,
+           not graph depth — then flush observer notifications. *)
+        while not (Rank_map.is_empty !(owner.computations)) do
+          let rank, queue = Rank_map.min_binding !(owner.computations) in
+          (try
+            run_tasks queue (Queue.length queue) (fun task ->
+                incr dirty_count;
+                task ())
+          with exn ->
+            prune_computation_queue owner rank queue;
+            raise exn);
+          prune_computation_queue owner rank queue
+        done;
+        (* Observers read a consistent graph: all queued computations finished
+           first. A failing observer does not starve the rest; the first error
+           propagates once the snapshot drains. Work observers stage runs in a
+           later round. *)
+        let first_error = ref None in
+        run_tasks owner.observers (Queue.length owner.observers) (fun f ->
+            try f ()
+            with exn ->
+              if !first_error = None then first_error := Some exn);
+        match !first_error with None -> () | Some exn -> raise exn
       end
     end
   done;
@@ -224,10 +269,6 @@ let stabilize_impl owner =
       stabilization_dirty_tasks = !dirty_count;
     }
 
-(* Only retains schedulers while their synchronous flush is running. A nested
-   flush of the same owner leaves queued work to the outer fixpoint loop. *)
-let stabilizing_owners = ref []
-
 (* Fun.protect's exceptional path restores raw backtraces, which Melange does
    not implement. These finalizers only reset internal refs and cannot raise. *)
 let with_finally finally f =
@@ -235,43 +276,74 @@ let with_finally finally f =
   | result -> finally (); result
   | exception exn -> finally (); raise exn
 
-let stabilize owner =
-  if not (List.exists (fun running -> running == owner) !stabilizing_owners) then
-    begin
-      stabilizing_owners := owner :: !stabilizing_owners;
-      with_finally
-        (fun () ->
-          stabilizing_owners :=
-            List.filter (fun running -> running != owner) !stabilizing_owners)
-        (fun () -> stabilize_impl owner)
-    end
+(* A nested stabilize on the same scheduler drains queued work synchronously:
+   callers inside tasks and observers may flush pending writes before reading
+   derived state. Snapshot-bounded task runs and identity-checked pruning keep
+   the outer fixpoint loop correct across reentrant drains. *)
+let stabilize owner = stabilize_impl owner
 
 let constant owner initial =
   {
     owner;
     rank = 0;
     current = ref initial;
-    next_subscriber_id = ref 0;
     subscribers = { first = None; last = None };
     upstream_subscriptions = ref [];
+    live_subscribers = ref 0;
+    reconnect = ref None;
     disposed_signal = ref false;
   }
 
-let sample reactive = !(reactive.current)
+(* With no live subscribers a derived node has no downstream reader; releasing
+   its upstream subscriptions stops recomputation and lets unneeded sources
+   deactivate too. The next subscription resubscribes through {!reconnect}. *)
+let release_upstream_if_orphaned reactive =
+  if
+    !(reactive.live_subscribers) = 0
+    && !(reactive.upstream_subscriptions) <> []
+  then begin
+    let subscriptions = !(reactive.upstream_subscriptions) in
+    reactive.upstream_subscriptions := [];
+    List.iter (fun subscription -> subscription.cancel ()) subscriptions
+  end
+
+(* Sampling an orphaned derived rescues it for the read only: reconnect
+   recomputes the fresh value, then release drops the upstream subscriptions
+   again so a read without subscribers does not leak liveness. *)
+let sample reactive =
+  if
+    (not !(reactive.disposed_signal))
+    && !(reactive.live_subscribers) = 0
+    && !(reactive.upstream_subscriptions) = []
+  then
+    match !(reactive.reconnect) with
+    | Some reconnect ->
+        reconnect ();
+        release_upstream_if_orphaned reactive
+    | None -> ()
+  else ();
+  !(reactive.current)
 
 let get = sample
 
-let subscribe ?(emit_initial = true) reactive callback =
+let signal_is_disposed reactive = !(reactive.disposed_signal)
+
+let subscribe_gen observer emit_initial reactive callback =
   if !(reactive.disposed_signal) then
     invalid_arg "cannot observe a disposed signal";
-  incr reactive.next_subscriber_id;
-  let subscriber_id = !(reactive.next_subscriber_id) in
+  (* Reactivate before linking: the reconnection recompute notifies only the
+     subscribers that were already live, and the emit-initial call below sees
+     the fresh value. *)
+  (match !(reactive.reconnect) with
+  | Some reconnect when !(reactive.upstream_subscriptions) = [] ->
+      reconnect ()
+  | _ -> ());
   let disposed = ref false in
   let subscriber_value =
     {
-      subscriber_id;
       callback;
       subscriber_disposed = disposed;
+      subscriber_observer = observer;
       previous = reactive.subscribers.last;
       next = None;
     }
@@ -288,20 +360,47 @@ let subscribe ?(emit_initial = true) reactive callback =
       | Some next -> next.previous <- subscriber_value.previous);
       subscriber_value.previous <- None;
       subscriber_value.next <- None;
-      subscriber_value.callback <- ignore
+      subscriber_value.callback <- ignore;
+      reactive.live_subscribers := !(reactive.live_subscribers) - 1;
+      release_upstream_if_orphaned reactive
     end
   in
   (match reactive.subscribers.last with
   | None -> reactive.subscribers.first <- Some subscriber_value
   | Some previous -> previous.next <- Some subscriber_value);
   reactive.subscribers.last <- Some subscriber_value;
+  reactive.live_subscribers := !(reactive.live_subscribers) + 1;
   if emit_initial then
     (try callback (sample reactive) with exn -> cancel (); raise exn);
   { disposed; cancel }
 
+let subscribe ?(emit_initial = true) reactive callback =
+  subscribe_gen true emit_initial reactive callback
+
+(* Computation subscribers only enqueue ranked tasks; they run inline during
+   publication so the whole graph settles before observer callbacks. *)
+let subscribe_computation reactive callback =
+  subscribe_gen false false reactive callback
+
 let observe reactive callback = subscribe ~emit_initial:true reactive callback
 
 let dispose_subscription subscription = subscription.cancel ()
+
+let subscription_disposed subscription = !(subscription.disposed)
+
+(* External cancel handles share the same record shape so {!dispose_subscription}
+   and {!subscription_disposed} work uniformly; cancellation is idempotent. *)
+let make_subscription cancel =
+  let disposed = ref false in
+  {
+    disposed;
+    cancel =
+      (fun () ->
+        if not !disposed then begin
+          disposed := true;
+          cancel ()
+        end);
+  }
 
 let dispose_signal reactive =
   if !(reactive.disposed_signal) then ()
@@ -321,7 +420,8 @@ let dispose_signal reactive =
     in
     clear reactive.subscribers.first;
     reactive.subscribers.first <- None;
-    reactive.subscribers.last <- None
+    reactive.subscribers.last <- None;
+    reactive.live_subscribers := 0
   end
 
 let run_each f values =
@@ -342,10 +442,21 @@ let publish reactive next_value =
       | None -> List.rev accumulated
       | Some subscriber -> snapshot (subscriber :: accumulated) subscriber.next
     in
+    (* Computation subscribers schedule ranked work inline; user, switch, and
+       keyed observers queue onto the observer queue drained once the whole
+       computation phase completes, so observers read a consistent graph.
+       Cancelled subscribers neutralize their callback; the thunk rechecks
+       disposal at run time. *)
     run_each
       (fun subscriber_value ->
         if not !(reactive.disposed_signal) then
-          subscriber_value.callback next_value)
+          if subscriber_value.subscriber_observer then
+            Queue.add
+              (fun () ->
+                if not !(reactive.disposed_signal) then
+                  subscriber_value.callback next_value)
+              reactive.owner.observers
+          else subscriber_value.callback next_value)
       (snapshot [] reactive.subscribers.first)
   end
 
@@ -377,6 +488,9 @@ let update state_value update_fn =
   in
   set state_value (update_fn current)
 
+(* The recompute task of a derived that loses its last subscriber is skipped
+   while its upstream subscriptions are released; resubscribing recomputes on
+   demand through {!reconnect}. *)
 let map transform source =
   let derived =
     {
@@ -385,13 +499,18 @@ let map transform source =
     }
   in
   let scheduled = ref false in
-  let subscription =
-    subscribe ~emit_initial:false source (fun _current ->
+  let subscribe_upstream () =
+    subscribe_computation source (fun _current ->
         schedule_computation derived scheduled (fun () ->
             publish derived (transform (sample source))))
   in
-  derived.upstream_subscriptions :=
-    !(derived.upstream_subscriptions) @ [ subscription ];
+  derived.upstream_subscriptions := [ subscribe_upstream () ];
+  derived.reconnect :=
+    Some
+      (fun () ->
+        derived.upstream_subscriptions := [ subscribe_upstream () ];
+        let next_value = transform (sample source) in
+        if next_value != !(derived.current) then publish derived next_value);
   derived
 
 let map2 transform left right =
@@ -410,11 +529,20 @@ let map2 transform left right =
     schedule_computation derived scheduled (fun () ->
         publish derived (transform (sample left) (sample right)))
   in
-  let left_subscription = subscribe ~emit_initial:false left recompute in
-  (try
-    let right_subscription = subscribe ~emit_initial:false right recompute in
-    derived.upstream_subscriptions := [ left_subscription; right_subscription ]
-  with exn -> dispose_subscription left_subscription; raise exn);
+  let subscribe_upstream () =
+    let left_subscription = subscribe_computation left recompute in
+    try
+      let right_subscription = subscribe_computation right recompute in
+      [ left_subscription; right_subscription ]
+    with exn -> dispose_subscription left_subscription; raise exn
+  in
+  derived.upstream_subscriptions := subscribe_upstream ();
+  derived.reconnect :=
+    Some
+      (fun () ->
+        derived.upstream_subscriptions := subscribe_upstream ();
+        let next_value = transform (sample left) (sample right) in
+        if next_value != !(derived.current) then publish derived next_value);
   derived
 
 let cutoff equal source =
@@ -422,15 +550,21 @@ let cutoff equal source =
     { (constant source.owner (sample source)) with rank = source.rank + 1 }
   in
   let scheduled = ref false in
-  derived.upstream_subscriptions :=
-    !(derived.upstream_subscriptions)
-    @ [
-        subscribe ~emit_initial:false source (fun _ ->
-            schedule_computation derived scheduled (fun () ->
-                let next_value = sample source in
-                if not (equal (sample derived) next_value) then
-                  publish derived next_value));
-      ];
+  let subscribe_upstream () =
+    subscribe_computation source (fun _ ->
+        schedule_computation derived scheduled (fun () ->
+            let next_value = sample source in
+            if not (equal (sample derived) next_value) then
+              publish derived next_value))
+  in
+  derived.upstream_subscriptions := [ subscribe_upstream () ];
+  derived.reconnect :=
+    Some
+      (fun () ->
+        derived.upstream_subscriptions := [ subscribe_upstream () ];
+        let next_value = sample source in
+        if not (equal (sample derived) next_value) then
+          publish derived next_value);
   derived
 
 let next_scope_id = ref 0
@@ -440,7 +574,6 @@ let make_scope name =
   {
     scope_id = !next_scope_id;
     scope_name = name;
-    next_cleanup_id = ref 0;
     cleanup_callbacks = ref [];
     mount_callbacks = ref [];
     unmount_callbacks = ref [];
@@ -450,62 +583,64 @@ let make_scope name =
     disposed_scope = ref false;
   }
 
+(* Amortized compaction: once dead nodes outnumber live ones, one filtered
+   pass restores the bound — at most twice as many stored nodes as live
+   registrations. Skipped while the scope disposes; its lists are cleared. *)
+let compact_cleanups_if_unbalanced scope_value =
+  let registry = scope_value.registry in
+  if
+    not !(scope_value.disposed_scope)
+    && registry.cleanup_dead > registry.live_cleanups
+  then begin
+    scope_value.cleanup_callbacks :=
+      List.filter
+        (fun entry -> not !(entry.cleanup_live))
+        !(scope_value.cleanup_callbacks);
+    registry.cleanup_dead <- 0
+  end
+
 let register_cleanup scope_value callback =
   if !(scope_value.disposed_scope) then begin
     callback ();
     { disposed = ref true; cancel = (fun () -> ()) }
   end
   else begin
-    incr scope_value.next_cleanup_id;
-    let cleanup_id = !(scope_value.next_cleanup_id) in
     let disposed = ref false in
     let action = ref (Some callback) in
-    let unregister = ref (fun () -> ()) in
-    let detach () =
-      let f = !unregister in
-      unregister := (fun () -> ());
-      f ()
+    let registry = scope_value.registry in
+    let mark_dead () =
+      if not !(scope_value.disposed_scope) then begin
+        registry.live_cleanups <- registry.live_cleanups - 1;
+        registry.cleanup_dead <- registry.cleanup_dead + 1;
+        compact_cleanups_if_unbalanced scope_value
+      end
     in
-    let entry = {
-      cleanup_id;
-      cleanup_callback = (fun () ->
-        match !action with
-        | None -> ()
-        | Some callback ->
-            action := None;
-            disposed := true;
-            detach ();
-            callback ());
-    } in
+    let entry =
+      {
+        cleanup_live = disposed;
+        cleanup_callback =
+          (fun () ->
+            match !action with
+            | None -> ()
+            | Some callback ->
+                action := None;
+                disposed := true;
+                mark_dead ();
+                callback ());
+      }
+    in
     let cancel () =
       if !disposed then ()
       else begin
         disposed := true;
+        (* Releasing the captured callback before counting keeps a cancelled
+           entry from retaining the user's resources. *)
         action := None;
-        detach ()
+        mark_dead ()
       end
     in
-    let registry = scope_value.registry in
-    Hashtbl.add registry.live_cleanups cleanup_id ();
-    registry.cleanup_slots <- registry.cleanup_slots + 1;
+    registry.live_cleanups <- registry.live_cleanups + 1;
     scope_value.cleanup_callbacks := entry :: !(scope_value.cleanup_callbacks);
-    unregister := (fun () ->
-      Hashtbl.remove registry.live_cleanups cleanup_id;
-      if not !(scope_value.disposed_scope) &&
-         Hashtbl.length registry.live_cleanups <= registry.cleanup_slots / 2 then
-        begin
-          scope_value.cleanup_callbacks :=
-            List.filter
-              (fun current -> Hashtbl.mem registry.live_cleanups current.cleanup_id)
-              !(scope_value.cleanup_callbacks);
-          registry.cleanup_slots <- Hashtbl.length registry.live_cleanups;
-          (* Remove retains the hash table's peak bucket array. Rebuild only
-             during proportional compaction, keeping metadata bounded too. *)
-          Hashtbl.reset registry.live_cleanups;
-          List.iter
-            (fun current -> Hashtbl.add registry.live_cleanups current.cleanup_id ())
-            !(scope_value.cleanup_callbacks)
-        end);
     { disposed; cancel }
   end
 
@@ -519,14 +654,51 @@ let rec child_scope name parent =
     (own child (register_cleanup parent (fun () -> dispose_scope child)));
   child
 
+(* Dead owned nodes are dropped when counted cancellations exceed half the
+   list; cancellations through a raw handle are swept when the list grows past
+   the scan watermark. Both keep the retained list within a constant factor
+   of live handles. *)
+and sweep_owned scope_value =
+  let registry = scope_value.registry in
+  scope_value.owned_subscriptions :=
+    List.filter
+      (fun current -> not !(current.disposed))
+      !(scope_value.owned_subscriptions);
+  registry.owned_slots <- List.length !(scope_value.owned_subscriptions);
+  registry.owned_dead <- 0;
+  registry.owned_scan <- max 64 (2 * registry.owned_slots)
+
 and own scope_value subscription =
-  if !(scope_value.disposed_scope) then dispose_subscription subscription
+  if !(scope_value.disposed_scope) then begin
+    dispose_subscription subscription;
+    subscription
+  end
   else begin
+    let registry = scope_value.registry in
+    registry.owned_slots <- registry.owned_slots + 1;
+    let owned =
+      {
+        disposed = subscription.disposed;
+        cancel =
+          (fun () ->
+            if !(subscription.disposed) then ()
+            else begin
+              subscription.cancel ();
+              if not !(scope_value.disposed_scope) then begin
+                registry.owned_dead <- registry.owned_dead + 1;
+                if registry.owned_dead * 2 > registry.owned_slots then
+                  sweep_owned scope_value
+              end
+            end);
+      }
+    in
     scope_value.owned_subscriptions :=
-      subscription :: !(scope_value.owned_subscriptions);
-    scope_value.registry.owned_slots <- scope_value.registry.owned_slots + 1
-  end;
-  subscription
+      owned :: !(scope_value.owned_subscriptions);
+    (if registry.owned_slots >= registry.owned_scan then
+      sweep_owned scope_value);
+    owned
+  end
+
 
 and dispose_scope scope_value =
   if !(scope_value.disposed_scope) then ()
@@ -543,10 +715,12 @@ and dispose_scope scope_value =
     scope_value.owned_subscriptions := [];
     scope_value.mount_callbacks := [];
     scope_value.unmount_callbacks := [];
-    Hashtbl.reset scope_value.registry.live_cleanups;
-    scope_value.registry.cleanup_slots <- 0;
-    scope_value.registry.owned_slots <- 0;
-    scope_value.registry.cancelled_owned <- 0;
+    let registry = scope_value.registry in
+    registry.live_cleanups <- 0;
+    registry.cleanup_dead <- 0;
+    registry.owned_slots <- 0;
+    registry.owned_dead <- 0;
+    registry.owned_scan <- 64;
     run_cleanups
       [
         (fun () ->
@@ -563,8 +737,14 @@ and dispose_scope scope_value =
 
 let scope name = make_scope name
 
-let scope_cleanup_count scope_value =
-  Hashtbl.length scope_value.registry.live_cleanups
+let scope_id scope_value = scope_value.scope_id
+let scope_name scope_value = scope_value.scope_name
+let scope_is_disposed scope_value = !(scope_value.disposed_scope)
+let scope_cleanup_entries scope_value = !(scope_value.cleanup_callbacks)
+let scope_owned_entries scope_value = !(scope_value.owned_subscriptions)
+let cleanup_entry_run entry = entry.cleanup_callback ()
+
+let scope_cleanup_count scope_value = scope_value.registry.live_cleanups
 
 let scope_owned_count scope_value =
   List.fold_left
@@ -602,7 +782,9 @@ let mount scope_value =
 let active scope_value =
   !(scope_value.mounted) && not !(scope_value.disposed_scope)
 
-let state_slot name = { slot_name = name; slot_states = Hashtbl.create 8 }
+let state_slot _name = { slot_states = Hashtbl.create 8 }
+
+let state_slot_count slot = Hashtbl.length slot.slot_states
 
 let state_at scheduler scope_value slot initial =
   if !(scope_value.disposed_scope)
@@ -628,9 +810,9 @@ let dispose_switch switch_value =
         (fun () -> dispose_scope !(switch_value.switch_scope)) ]
   end
 
-(* Collection handles unregister themselves on manual disposal. Clearing the
-   action also prevents an externally retained disposed handle retaining its
-   owner and former resources. *)
+(* Collection handles unregister themselves on manual disposal through the
+   counted owned handle. Clearing the action also prevents an externally
+   retained disposed handle retaining its owner and former resources. *)
 let own_lifetime parent cleanup =
   let action = ref (fun () -> ()) in
   let disposed = ref false in
@@ -638,19 +820,9 @@ let own_lifetime parent cleanup =
   action := (fun () ->
     action := (fun () -> ());
     disposed := true;
-    let registry = parent.registry in
-    if not !(parent.disposed_scope) then begin
-      registry.cancelled_owned <- registry.cancelled_owned + 1;
-      if registry.cancelled_owned >= registry.owned_slots - registry.owned_slots / 2 then begin
-        parent.owned_subscriptions :=
-          List.filter (fun current -> not !(current.disposed)) !(parent.owned_subscriptions);
-        registry.owned_slots <- List.length !(parent.owned_subscriptions);
-        registry.cancelled_owned <- 0
-      end
-    end;
     cleanup ());
-  ignore (own parent handle);
-  fun () -> handle.cancel ()
+  let owned = own parent handle in
+  fun () -> owned.cancel ()
 
 let switch parent source equal mount_scope =
   if !(parent.disposed_scope) then
@@ -981,3 +1153,17 @@ let keyed_find_scope keyed_value key =
         else loop rest
   in
   loop !(keyed_value.keyed_entries)
+
+let switch_scope switch_value = !(switch_value.switch_scope)
+let switch_is_disposed switch_value = !(switch_value.switch_disposed)
+let switch_subscription switch_value = switch_value.switch_subscription
+
+let keyed_entries keyed_value = !(keyed_value.keyed_entries)
+let keyed_is_disposed keyed_value = !(keyed_value.keyed_disposed)
+
+let make_keyed_entry entry_key entry_state entry_scope =
+  { entry_key; entry_state; entry_scope }
+
+let keyed_entry_key entry = entry.entry_key
+let keyed_entry_state entry = entry.entry_state
+let keyed_entry_scope entry = entry.entry_scope
